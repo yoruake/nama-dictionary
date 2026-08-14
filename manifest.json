@@ -1,13 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Nama · 多语言查词",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "description": "选中网页上的外语单词，自动分析转写、词源、词义和句中作用。",
   "permissions": ["storage", "activeTab"],
   "host_permissions": [
-    "https://api.deepseek.com/*",
-    "https://www.youtube.com/api/timedtext*",
-    "https://*.nflxvideo.net/*"
+    "https://api.deepseek.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -18,18 +16,6 @@
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
-    },
-    {
-      "matches": ["*://*.youtube.com/*", "*://*.netflix.com/*"],
-      "js": ["subtitle.js"],
-      "css": ["subtitle.css"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["*://*.youtube.com/*", "*://*.netflix.com/*"],
-      "js": ["subtitle-bridge.js"],
-      "run_at": "document_start",
-      "world": "MAIN"
     }
   ],
   "options_page": "options.html",

@@ -136,51 +136,11 @@ async function handleMessage(message) {
       return getCacheStats();
     case "CLEAR_CACHE":
       return clearCache();
-    case "FETCH_SUBTITLE":
-      return fetchSubtitle(message);
-    case "WARM_API":
-      return warmApi();
     case "OPEN_OPTIONS":
       await chrome.runtime.openOptionsPage();
       return { ok: true };
     default:
       return createFailure("bad_request", "未知请求类型");
-  }
-}
-
-// 取字幕文件。放在这里跑是为了绕开 CORS（Netflix 的字幕在 nflxvideo.net 上）。
-// URL 来自页面主世界的 bridge，属于不可信输入，所以只放行这几个字幕域名。
-const SUBTITLE_HOSTS = [
-  /^www\.youtube\.com$/,
-  /^[a-z0-9-]+\.googlevideo\.com$/,
-  /^[a-z0-9.-]+\.nflxvideo\.net$/,
-  /^[a-z0-9.-]+\.netflix\.com$/
-];
-
-async function fetchSubtitle(message) {
-  let url;
-  try {
-    url = new URL(String(message.url || ""));
-  } catch (error) {
-    return createFailure("bad_request", "字幕地址不合法");
-  }
-
-  if (url.protocol !== "https:" || !SUBTITLE_HOSTS.some((re) => re.test(url.hostname))) {
-    return createFailure("bad_request", `不允许的字幕来源：${url.hostname}`);
-  }
-
-  try {
-    const response = await fetch(url.toString(), { credentials: "omit" });
-    if (!response.ok) {
-      return createFailure("network", `字幕请求失败：HTTP ${response.status}`);
-    }
-    const text = await response.text();
-    if (!text) {
-      return createFailure("network", "字幕内容为空");
-    }
-    return { ok: true, text };
-  } catch (error) {
-    return createFailure("network", error.message || "字幕请求失败");
   }
 }
 
@@ -399,17 +359,6 @@ async function clearCache() {
     count: preservedEntries.length,
     starredCount: preservedEntries.length
   };
-}
-
-// 预热：鼠标一进字幕就调一次，把 service worker 叫醒 + 把到 DeepSeek 的 TLS 连接建好。
-// 真正查词时就省掉了冷启动和握手的时间。请求本身失败无所谓，连接建上就行。
-async function warmApi() {
-  try {
-    await fetch(API_ENDPOINT, { method: "HEAD" });
-  } catch (error) {
-    // 预热失败不影响任何功能
-  }
-  return { ok: true };
 }
 
 async function streamDeepSeek(apiKey, word, sentence, onText) {

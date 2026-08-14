@@ -36,7 +36,7 @@
     }, QUERY_DELAY_MS);
   }
 
-  // 查词主流程。除选中文本外，字幕栏悬停查词(subtitle.js)也走这里。
+  // 查词主流程。
   // 优先走流式：模型逐行输出，拿到一行就渲染一行，不用等六个字段全写完。
   function runLookup(word, sentence, rect) {
     if (!word) {
@@ -414,7 +414,7 @@
     }
   }
 
-  // 全屏时(YouTube/Netflix)只有全屏元素的子树会被渲染，卡片必须挂到全屏元素里。
+  // 全屏时只有全屏元素的子树会被渲染，卡片必须挂到全屏元素里。
   function cardHost() {
     return document.fullscreenElement || document.documentElement;
   }
@@ -987,11 +987,4 @@
   }
 
   initHighlight().catch((e) => console.debug("[多语言查词助手] 高亮初始化失败", e));
-
-  // 供同一扩展的其它内容脚本(subtitle.js)复用查词卡片。
-  // 内容脚本共享同一个隔离世界的 window，所以直接挂在 window 上即可。
-  window.__namaDict = {
-    lookup: runLookup,
-    close: closeCard
-  };
 })();
