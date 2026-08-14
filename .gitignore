@@ -2,6 +2,9 @@
 HANDOFF.md
 .claude/
 
+# Zotero 插件：本地保留，不入库（本仓库只发布浏览器扩展）
+zotero-deeplex/
+
 # 旧版本嵌套副本（GitHub zip 解压残留）
 DeepLex-AI-powered-browser-dictionary-for-serious-language-learners-main/
 
