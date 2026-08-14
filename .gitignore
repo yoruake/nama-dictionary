@@ -1,0 +1,16 @@
+# 本地开发文档与配置
+HANDOFF.md
+.claude/
+
+# 旧版本嵌套副本（GitHub zip 解压残留）
+DeepLex-AI-powered-browser-dictionary-for-serious-language-learners-main/
+
+# 测试用素材，勿入库
+ch3.txt
+ch4.txt
+*.epub
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -5,6 +5,12 @@
   letter-spacing: 0;
 }
 
+/* 生词页内高亮：纯静态点线下划线，不改文字颜色、不响应鼠标 */
+.mlwa-hl {
+  border-bottom: 2px dotted rgba(79, 70, 229, 0.75);
+  background: transparent;
+}
+
 #mlwa-card-root {
   position: absolute;
   z-index: 2147483647;

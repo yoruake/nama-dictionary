@@ -15,6 +15,19 @@ function bindElements() {
   elements.saveKey = document.getElementById("save-key");
   elements.saveStatus = document.getElementById("save-status");
   elements.openVocabulary = document.getElementById("open-vocabulary");
+  elements.highlightEnabled = document.getElementById("highlight-enabled");
+  elements.subtitleEnabled = document.getElementById("subtitle-enabled");
+  elements.subtitleAutoPause = document.getElementById("subtitle-autopause");
+  elements.subtitleMerge = document.getElementById("subtitle-merge");
+  elements.subtitleMaxChars = document.getElementById("subtitle-max-chars");
+  elements.subtitleMaxCharsValue = document.getElementById("subtitle-max-chars-value");
+  elements.subtitleFontSize = document.getElementById("subtitle-font-size");
+  elements.subtitleFontSizeValue = document.getElementById("subtitle-font-size-value");
+  elements.subtitleBottom = document.getElementById("subtitle-bottom");
+  elements.subtitleBottomValue = document.getElementById("subtitle-bottom-value");
+  elements.subtitleFontFamily = document.getElementById("subtitle-font-family");
+  elements.subtitleFontCustom = document.getElementById("subtitle-font-custom");
+  elements.subtitleBackdrop = document.getElementById("subtitle-backdrop");
   elements.cacheCount = document.getElementById("cache-count");
   elements.clearCache = document.getElementById("clear-cache");
   elements.testWord = document.getElementById("test-word");
@@ -31,13 +44,103 @@ function bindEvents() {
 
   elements.saveKey.addEventListener("click", saveApiKey);
   elements.openVocabulary.addEventListener("click", openVocabulary);
+  elements.highlightEnabled.addEventListener("change", saveHighlightEnabled);
+  elements.subtitleEnabled.addEventListener("change", saveSubtitleEnabled);
+  elements.subtitleAutoPause.addEventListener("change", () => {
+    setStorage({ subtitleAutoPause: elements.subtitleAutoPause.checked });
+    showSaveStatus(elements.subtitleAutoPause.checked ? "已开启每句末尾自动暂停" : "已关闭自动暂停");
+  });
+  elements.subtitleMerge.addEventListener("change", () => {
+    setStorage({ subtitleMergeSentences: elements.subtitleMerge.checked });
+    showSaveStatus(elements.subtitleMerge.checked ? "已开启整句合并" : "已关闭整句合并");
+  });
+  elements.subtitleMaxChars.addEventListener("input", () => {
+    elements.subtitleMaxCharsValue.textContent = elements.subtitleMaxChars.value;
+    setStorage({ subtitleMaxChars: Number(elements.subtitleMaxChars.value) });
+  });
+  elements.subtitleFontSize.addEventListener("input", () => {
+    elements.subtitleFontSizeValue.textContent = elements.subtitleFontSize.value;
+    setStorage({ subtitleFontSize: Number(elements.subtitleFontSize.value) });
+  });
+  elements.subtitleBottom.addEventListener("input", () => {
+    elements.subtitleBottomValue.textContent = elements.subtitleBottom.value;
+    setStorage({ subtitleBottomPct: Number(elements.subtitleBottom.value) });
+  });
+  elements.subtitleFontFamily.addEventListener("change", saveSubtitleFont);
+  elements.subtitleFontCustom.addEventListener("input", saveSubtitleFont);
+  elements.subtitleBackdrop.addEventListener("change", () => {
+    setStorage({ subtitleBackdrop: elements.subtitleBackdrop.value });
+  });
   elements.clearCache.addEventListener("click", clearCache);
   elements.testApi.addEventListener("click", testApiKey);
 }
 
 async function loadSettings() {
-  const result = await getStorage([API_KEY_STORAGE_KEY]);
+  const result = await getStorage([
+    API_KEY_STORAGE_KEY,
+    "highlightEnabled",
+    "subtitleEnabled",
+    "subtitleAutoPause",
+    "subtitleMergeSentences",
+    "subtitleFontSize",
+    "subtitleFontFamily",
+    "subtitleBackdrop",
+    "subtitleBottomPct",
+    "subtitleMaxChars"
+  ]);
+
   elements.apiKey.value = result[API_KEY_STORAGE_KEY] || "";
+  elements.highlightEnabled.checked = result.highlightEnabled === undefined
+    ? true
+    : Boolean(result.highlightEnabled);
+  elements.subtitleEnabled.checked = result.subtitleEnabled === undefined
+    ? true
+    : Boolean(result.subtitleEnabled);
+  elements.subtitleAutoPause.checked = Boolean(result.subtitleAutoPause);
+  elements.subtitleMerge.checked = Boolean(result.subtitleMergeSentences);
+
+  const fontSize = Number(result.subtitleFontSize) || 28;
+  elements.subtitleFontSize.value = String(fontSize);
+  elements.subtitleFontSizeValue.textContent = String(fontSize);
+
+  const bottomPct = result.subtitleBottomPct === undefined ? 12 : Number(result.subtitleBottomPct);
+  elements.subtitleBottom.value = String(bottomPct);
+  elements.subtitleBottomValue.textContent = String(bottomPct);
+
+  const maxChars = Number(result.subtitleMaxChars) || 80;
+  elements.subtitleMaxChars.value = String(maxChars);
+  elements.subtitleMaxCharsValue.textContent = String(maxChars);
+
+  // 存的是最终 font-family 字符串：能对上下拉项就选中，否则算自定义
+  const fontFamily = result.subtitleFontFamily || "";
+  const known = Array.from(elements.subtitleFontFamily.options)
+    .some((option) => option.value === fontFamily);
+  if (known) {
+    elements.subtitleFontFamily.value = fontFamily;
+    elements.subtitleFontCustom.value = "";
+  } else {
+    elements.subtitleFontFamily.value = "";
+    elements.subtitleFontCustom.value = fontFamily;
+  }
+
+  elements.subtitleBackdrop.value = ["shadow", "box", "none"].includes(result.subtitleBackdrop)
+    ? result.subtitleBackdrop
+    : "shadow";
+}
+
+async function saveSubtitleEnabled() {
+  await setStorage({ subtitleEnabled: elements.subtitleEnabled.checked });
+  showSaveStatus(elements.subtitleEnabled.checked ? "已开启视频字幕模式（刷新播放页生效）" : "已关闭视频字幕模式");
+}
+
+async function saveSubtitleFont() {
+  const custom = elements.subtitleFontCustom.value.trim();
+  await setStorage({ subtitleFontFamily: custom || elements.subtitleFontFamily.value });
+}
+
+async function saveHighlightEnabled() {
+  await setStorage({ highlightEnabled: elements.highlightEnabled.checked });
+  showSaveStatus(elements.highlightEnabled.checked ? "已开启页内高亮（刷新网页生效）" : "已关闭页内高亮（刷新网页生效）");
 }
 
 async function saveApiKey() {

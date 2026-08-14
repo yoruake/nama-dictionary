@@ -50,14 +50,69 @@ p {
 }
 
 .toolbar {
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) 180px 160px;
+  display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 16px;
   background: #ffffff;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   padding: 12px;
+}
+
+.toolbar #search-input {
+  flex: 1 1 200px;
+}
+
+.toolbar select {
+  flex: 0 1 auto;
+  min-width: 120px;
+}
+
+.select-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.select-bar #select-count {
+  color: #64748b;
+  font-size: 14px;
+}
+
+.select-bar button {
+  min-height: 34px;
+  padding: 6px 12px;
+}
+
+.vocab-check {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  min-height: 0;
+  cursor: pointer;
+  flex: none;
+  align-self: start;
+  margin-top: 4px;
+}
+
+.vocab-date {
+  color: #94a3b8;
+  font-size: 12px;
+  margin-left: 8px;
+}
+
+.vocab-exported {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  color: #0f766e;
+  background: #ecfdf5;
+  border: 1px solid rgba(15, 118, 110, 0.2);
+  border-radius: 999px;
+  font-size: 12px;
 }
 
 input,
@@ -143,7 +198,7 @@ button {
 
 .vocab-summary {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 12px;
   align-items: center;
   cursor: pointer;

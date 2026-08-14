@@ -21,11 +21,29 @@
         <select id="language-filter" aria-label="按语言筛选">
           <option value="">全部语言</option>
         </select>
+        <select id="time-filter" aria-label="按时间筛选">
+          <option value="all">全部时间</option>
+          <option value="today">今天</option>
+          <option value="7d">近7天</option>
+          <option value="30d">近30天</option>
+        </select>
+        <select id="export-filter" aria-label="按导出状态筛选">
+          <option value="all">全部</option>
+          <option value="new">未导出</option>
+          <option value="done">已导出</option>
+        </select>
         <select id="sort-order" aria-label="排序方式">
           <option value="newest">最新优先</option>
           <option value="oldest">最早优先</option>
           <option value="language">按语言</option>
         </select>
+      </section>
+
+      <section id="select-bar" class="select-bar" aria-label="批量操作">
+        <span id="select-count">已选 0 项</span>
+        <button id="select-all" type="button" class="secondary-button">全选</button>
+        <button id="select-clear" type="button" class="secondary-button">清空选择</button>
+        <button id="delete-selected" type="button" class="danger-button" disabled>删除选中 (0)</button>
       </section>
 
       <section id="empty-state" class="empty-state" hidden>
@@ -34,17 +52,6 @@
 
       <section id="vocab-list" class="vocab-list" aria-live="polite"></section>
     </main>
-
-    <dialog id="export-dialog" class="export-dialog">
-      <form method="dialog">
-        <h2>选择导出范围</h2>
-        <div id="export-options" class="export-options"></div>
-        <div class="dialog-actions">
-          <button value="cancel" type="submit" class="secondary-button">取消</button>
-          <button id="confirm-export" value="confirm" type="button" class="primary-button">确认导出</button>
-        </div>
-      </form>
-    </dialog>
 
     <script src="vocabulary.js"></script>
   </body>

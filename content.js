@@ -1,13 +1,15 @@
 (function () {
   const CARD_ID = "mlwa-card-root";
   const CARD_WIDTH = 300;
-  const MAX_SELECTED_WORDS = 2;
   const QUERY_DELAY_MS = 30;
 
   let activeRequestId = 0;
   let activeCard = null;
   let outsideClickHandler = null;
   let currentLookup = null;
+  let activePort = null;
+  // 本页查过的词，再悬停时直接出结果（背景页那边也有缓存，但省掉一次消息往返）
+  const lookupMemo = new Map();
 
   document.addEventListener("mouseup", handleMouseUp, true);
   document.addEventListener("keydown", (event) => {
@@ -15,6 +17,8 @@
       closeCard();
     }
   });
+  // 进出全屏后卡片位置必然失效，直接关掉。
+  document.addEventListener("fullscreenchange", closeCard);
 
   function handleMouseUp(event) {
     if (activeCard?.contains(event.target)) {
@@ -28,53 +32,160 @@
       }
 
       const { word, sentence, rect } = selectionInfo;
-      const requestId = ++activeRequestId;
-      currentLookup = { word, sentence, id: null, starred: false };
-
-      showLoadingCard(word, rect);
-
-      sendRuntimeMessage({
-        type: "LOOKUP_WORD",
-        word,
-        sentence,
-        useCache: true
-      })
-        .then((response) => {
-          if (requestId !== activeRequestId) {
-            return;
-          }
-
-          if (!response?.ok) {
-            showError(response?.error || { type: "unknown", message: "查询失败" }, word, rect);
-            return;
-          }
-
-          currentLookup = {
-            word,
-            sentence,
-            id: response.id || response.data?.id || null,
-            starred: Boolean(response.data?.starred)
-          };
-          renderResult(response.data, {
-            cached: Boolean(response.cached),
-            rect
-          });
-        })
-        .catch((error) => {
-          if (requestId !== activeRequestId) {
-            return;
-          }
-
-          showError(
-            {
-              type: "runtime_error",
-              message: error.message || "扩展通信失败"
-            },
-            word,
-            rect
-          );
-        });
+      runLookup(word, sentence, rect);
     }, QUERY_DELAY_MS);
+  }
+
+  // 查词主流程。除选中文本外，字幕栏悬停查词(subtitle.js)也走这里。
+  // 优先走流式：模型逐行输出，拿到一行就渲染一行，不用等六个字段全写完。
+  function runLookup(word, sentence, rect) {
+    if (!word) {
+      return;
+    }
+
+    const requestId = ++activeRequestId;
+    currentLookup = { word, sentence, id: null, starred: false };
+
+    // 本页查过的词直接复原，连消息都不用发
+    const memo = lookupMemo.get(word);
+    if (memo) {
+      currentLookup.id = memo.id || null;
+      currentLookup.starred = Boolean(memo.starred);
+      renderResult(memo, { cached: true, rect });
+      return;
+    }
+
+    showLoadingCard(word, rect);
+
+    if (!startStreamingLookup(word, sentence, rect, requestId)) {
+      fallbackLookup(word, sentence, rect, requestId);
+    }
+  }
+
+  function startStreamingLookup(word, sentence, rect, requestId) {
+    let port = null;
+    try {
+      port = chrome.runtime.connect({ name: "nama-lookup" });
+    } catch (error) {
+      return false;
+    }
+    if (!port) {
+      return false;
+    }
+
+    closeActivePort();
+    activePort = port;
+    let answered = false;
+
+    port.onMessage.addListener((message) => {
+      if (requestId !== activeRequestId || !message) {
+        return;
+      }
+
+      if (message.type === "partial") {
+        answered = true;
+        renderResult(message.data, { rect, partial: true });
+        return;
+      }
+
+      if (message.type === "done") {
+        answered = true;
+        currentLookup = {
+          word,
+          sentence,
+          id: message.id || null,
+          starred: Boolean(message.data && message.data.starred)
+        };
+        if (message.data) {
+          lookupMemo.set(word, message.data);
+        }
+        renderResult(message.data, { cached: Boolean(message.cached), rect });
+        closeActivePort();
+        return;
+      }
+
+      if (message.type === "error") {
+        answered = true;
+        showError(message.error || { type: "unknown", message: "查询失败" }, word, rect);
+        closeActivePort();
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (activePort === port) {
+        activePort = null;
+      }
+      // 后台没接住（比如 service worker 刚被回收）→ 退回一次性请求
+      if (!answered && requestId === activeRequestId) {
+        fallbackLookup(word, sentence, rect, requestId);
+      }
+    });
+
+    try {
+      port.postMessage({ type: "LOOKUP_STREAM", word, sentence });
+    } catch (error) {
+      closeActivePort();
+      return false;
+    }
+    return true;
+  }
+
+  function closeActivePort() {
+    if (activePort) {
+      try {
+        activePort.disconnect();
+      } catch (error) {
+        // 已经断了
+      }
+      activePort = null;
+    }
+  }
+
+  function fallbackLookup(word, sentence, rect, requestId) {
+    sendRuntimeMessage({
+      type: "LOOKUP_WORD",
+      word,
+      sentence,
+      useCache: true
+    })
+      .then((response) => {
+        if (requestId !== activeRequestId) {
+          return;
+        }
+
+        if (!response?.ok) {
+          showError(response?.error || { type: "unknown", message: "查询失败" }, word, rect);
+          return;
+        }
+
+        currentLookup = {
+          word,
+          sentence,
+          id: response.id || response.data?.id || null,
+          starred: Boolean(response.data?.starred)
+        };
+        if (response.data) {
+          lookupMemo.set(word, response.data);
+        }
+        renderResult(response.data, {
+          cached: Boolean(response.cached),
+          rect
+        });
+      })
+      .catch((error) => {
+        if (requestId !== activeRequestId) {
+          return;
+        }
+
+        showError(
+          {
+            type: "runtime_error",
+            message: error.message || "扩展通信失败"
+          },
+          word,
+          rect
+        );
+      });
   }
 
   function readSelection() {
@@ -87,7 +198,7 @@
     const rawText = selection.toString();
     const word = cleanSelectedText(rawText);
 
-    if (!word || getWordCount(word) > MAX_SELECTED_WORDS) {
+    if (!word) {
       closeCard();
       return null;
     }
@@ -111,10 +222,6 @@
       .replace(/\s+/g, " ")
       .replace(/^[\s"'“”‘’«»《》（）()[\]{}<>.,，、:：;؛.!?。！？؟۔]+/u, "")
       .replace(/[\s"'“”‘’«»《》（）()[\]{}<>.,，、:：;؛.!?。！？؟۔]+$/u, "");
-  }
-
-  function getWordCount(text) {
-    return text.split(/[\s\u200c]+/u).filter(Boolean).length;
   }
 
   function getRangeRect(range) {
@@ -262,22 +369,25 @@
 
   function renderResult(data, options = {}) {
     const card = ensureCard(options.rect);
-    const showRefresh = Boolean(options.cached);
+    const partial = Boolean(options.partial);
+    // 流式过程中还没写到的字段留省略号，别显示成"暂无"（那是"查不到"的意思）
+    const blank = partial ? "…" : "暂无";
+
     if (data?.id && currentLookup) {
       currentLookup.id = data.id;
       currentLookup.starred = Boolean(data.starred);
     }
 
     card.replaceChildren(
-      createHeader(data.word || "", data.translit || "", true, {
+      createHeader(data.word || currentLookup?.word || "", data.translit || "", true, {
         id: data.id,
         starred: Boolean(data.starred)
       }),
-      createLangTag(data.lang || "未知语言"),
-      createField("💡", "词义", data.meaning || "暂无"),
-      createField("🌱", "词源", data.etymology || "暂无"),
-      createField("📍", "句中作用", data.form || "暂无"),
-      createFooter(showRefresh)
+      createLangTag(data.lang || (partial ? "…" : "未知语言")),
+      createField("💡", "词义", data.meaning || blank),
+      createField("🌱", "词源", data.etymology || blank),
+      createField("📍", "句中作用", data.form || blank),
+      createFooter(partial)
     );
 
     if (options.rect) {
@@ -304,14 +414,23 @@
     }
   }
 
+  // 全屏时(YouTube/Netflix)只有全屏元素的子树会被渲染，卡片必须挂到全屏元素里。
+  function cardHost() {
+    return document.fullscreenElement || document.documentElement;
+  }
+
   function ensureCard(rect) {
+    const host = cardHost();
+
     if (!activeCard) {
       activeCard = document.createElement("div");
       activeCard.id = CARD_ID;
       activeCard.className = "mlwa-card";
       activeCard.addEventListener("mousedown", (event) => event.stopPropagation());
-      document.documentElement.appendChild(activeCard);
+      host.appendChild(activeCard);
       bindOutsideClick();
+    } else if (activeCard.parentNode !== host) {
+      host.appendChild(activeCard);
     }
 
     if (rect) {
@@ -323,8 +442,11 @@
 
   function positionCard(card, rect) {
     const margin = 12;
-    const scrollX = window.scrollX || window.pageXOffset;
-    const scrollY = window.scrollY || window.pageYOffset;
+    // 挂在全屏元素里时页面滚动无意义，改用 fixed + 视口坐标。
+    const isFixed = card.parentNode !== document.documentElement;
+    card.style.position = isFixed ? "fixed" : "absolute";
+    const scrollX = isFixed ? 0 : (window.scrollX || window.pageXOffset || 0);
+    const scrollY = isFixed ? 0 : (window.scrollY || window.pageYOffset || 0);
     const maxLeft = scrollX + window.innerWidth - CARD_WIDTH - margin;
     const left = Math.max(scrollX + margin, Math.min(scrollX + rect.left, maxLeft));
     const belowTop = scrollY + rect.bottom + 8;
@@ -437,19 +559,18 @@
     return status;
   }
 
-  function createFooter(showRefresh) {
+  function createFooter(partial = false) {
     const footer = document.createElement("div");
     footer.className = "mlwa-footer";
-
-    if (!showRefresh) {
-      return footer;
-    }
 
     const button = document.createElement("button");
     button.type = "button";
     button.className = "mlwa-secondary-button";
-    button.textContent = "重新分析句中作用";
-    button.addEventListener("click", handleReanalyzeClick);
+    button.textContent = partial ? "生成中…" : "重新分析";
+    button.disabled = partial;
+    if (!partial) {
+      button.addEventListener("click", handleReanalyzeClick);
+    }
     footer.appendChild(button);
 
     return footer;
@@ -538,7 +659,17 @@
         }
 
         currentLookup.starred = Boolean(response.data?.starred);
+        if (response.data && currentLookup.word) {
+          lookupMemo.set(currentLookup.word, response.data);
+        }
         updateStarButton(button, currentLookup.starred);
+
+        // 收藏/取消后就地更新页内高亮，无需刷新页面
+        if (currentLookup.starred) {
+          addHighlightWord(currentLookup.word);
+        } else {
+          removeHighlightWord(currentLookup.word);
+        }
       })
       .catch((error) => {
         button.disabled = false;
@@ -579,6 +710,7 @@
 
   function closeCard() {
     activeRequestId += 1;
+    closeActivePort();   // 卡片关了就别再让模型往下生成
     currentLookup = null;
     if (activeCard) {
       activeCard.remove();
@@ -618,4 +750,248 @@
       });
     });
   }
+
+  // ===== 生词页内高亮 =====
+  const HL_CLASS = "mlwa-hl";
+  const HL_SKIP_TAGS = new Set([
+    "SCRIPT", "STYLE", "NOSCRIPT", "TEXTAREA", "INPUT", "SELECT",
+    "CODE", "PRE", "KBD", "SAMP", "OPTION"
+  ]);
+
+  let hlRegex = null;
+  let hlObserver = null;
+  let hlSettingOn = false;
+  const hlForms = new Set(); // 已跟踪的生词（小写）
+
+  async function initHighlight() {
+    hlSettingOn = await getHighlightEnabled();
+    if (!hlSettingOn) {
+      return;
+    }
+    const resp = await sendRuntimeMessage({ type: "GET_ENTRIES" }).catch(() => null);
+    const entries = resp?.ok && Array.isArray(resp.entries)
+      ? resp.entries.filter((e) => e && e.starred && e.word)
+      : [];
+    for (const entry of entries) {
+      const form = String(entry.word || "").trim();
+      if (form.length >= 2) {
+        hlForms.add(form.toLowerCase());
+      }
+    }
+    rebuildRegex();
+    // 无论当前有没有词都启动观察器，方便之后新增的词也能覆盖到后续加载的内容
+    observeMutations();
+    if (hlRegex && document.body) {
+      highlightRoot(document.body);
+    }
+    scheduleRescans();
+  }
+
+  // 兜底：页面 load 完成及稍后再整页重扫几次，覆盖初次扫描后才插入的内容
+  // （观察器偶有遗漏的情况）。highlightRoot 幂等，已高亮的会跳过。
+  function scheduleRescans() {
+    const rescan = () => {
+      if (hlSettingOn && hlRegex && document.body) {
+        highlightRoot(document.body);
+      }
+    };
+    if (document.readyState !== "complete") {
+      window.addEventListener("load", rescan, { once: true });
+    }
+    setTimeout(rescan, 1500);
+    setTimeout(rescan, 4000);
+  }
+
+  function getHighlightEnabled() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(["highlightEnabled"], (r) => {
+        const v = r && r.highlightEnabled;
+        resolve(v === undefined ? true : Boolean(v));
+      });
+    });
+  }
+
+  function rebuildRegex() {
+    const forms = Array.from(hlForms).filter((f) => f.length >= 2);
+    if (!forms.length) {
+      hlRegex = null;
+      return;
+    }
+    forms.sort((a, b) => b.length - a.length); // 长词优先
+    const alt = forms.map(escapeRegex).join("|");
+    try {
+      hlRegex = new RegExp("(?<![\\p{L}\\p{M}])(" + alt + ")(?![\\p{L}\\p{M}])", "giu");
+    } catch (e) {
+      try {
+        hlRegex = new RegExp("(" + alt + ")", "giu");
+      } catch (e2) {
+        hlRegex = null;
+      }
+    }
+  }
+
+  // 收藏后：把该词的下划线就地加上，不刷新页面。
+  function addHighlightWord(word) {
+    if (!hlSettingOn) {
+      return;
+    }
+    const form = String(word || "").trim();
+    if (form.length < 2) {
+      return;
+    }
+    const key = form.toLowerCase();
+    if (!hlForms.has(key)) {
+      hlForms.add(key);
+      rebuildRegex();
+    }
+    if (!hlRegex || !document.body) {
+      return;
+    }
+    observeMutations();
+    highlightRoot(document.body); // 幂等：新词会被包裹，已高亮的会跳过
+  }
+
+  // 取消收藏后：就地去掉该词的下划线。
+  function removeHighlightWord(word) {
+    const key = String(word || "").trim().toLowerCase();
+    if (!hlForms.has(key)) {
+      return;
+    }
+    hlForms.delete(key);
+    rebuildRegex();
+    const spans = document.querySelectorAll("." + HL_CLASS);
+    for (const span of spans) {
+      if ((span.textContent || "").toLowerCase() === key) {
+        span.replaceWith(document.createTextNode(span.textContent));
+      }
+    }
+  }
+
+  function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function isSkippableParent(node) {
+    const parent = node.parentNode;
+    if (!parent || parent.nodeType !== 1) {
+      return true;
+    }
+    if (HL_SKIP_TAGS.has(parent.tagName) || parent.isContentEditable) {
+      return true;
+    }
+    if (parent.closest && parent.closest("." + HL_CLASS + ", #" + CARD_ID + ", #mlwa-hl-tip")) {
+      return true;
+    }
+    return false;
+  }
+
+  function highlightRoot(root) {
+    if (!root || !hlRegex) {
+      return;
+    }
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue || !node.nodeValue.trim()) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return isSkippableParent(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const targets = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      targets.push(n);
+    }
+    for (const node of targets) {
+      highlightTextNode(node);
+    }
+  }
+
+  function highlightTextNode(node) {
+    if (!hlRegex || !node.nodeValue || isSkippableParent(node)) {
+      return;
+    }
+    const text = node.nodeValue;
+    hlRegex.lastIndex = 0;
+    if (!hlRegex.test(text)) {
+      return;
+    }
+
+    hlRegex.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    let m;
+    while ((m = hlRegex.exec(text)) !== null) {
+      const matched = m[0];
+      if (!matched) {
+        hlRegex.lastIndex += 1;
+        continue;
+      }
+      const start = m.index;
+      if (start > last) {
+        frag.appendChild(document.createTextNode(text.slice(last, start)));
+      }
+      const span = document.createElement("span");
+      span.className = HL_CLASS;
+      span.textContent = matched;
+      frag.appendChild(span);
+      last = start + matched.length;
+    }
+    if (last < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(last)));
+    }
+    node.parentNode.replaceChild(frag, node);
+  }
+
+  function observeMutations() {
+    if (hlObserver || !document.body) {
+      return;
+    }
+    let pending = [];
+    let timer = null;
+    hlObserver = new MutationObserver((mutations) => {
+      for (const mu of mutations) {
+        for (const node of mu.addedNodes) {
+          if (node.nodeType === 1) {
+            if (node.id === CARD_ID || node.id === "mlwa-hl-tip") {
+              continue;
+            }
+            if (node.classList && node.classList.contains(HL_CLASS)) {
+              continue;
+            }
+            pending.push(node);
+          } else if (node.nodeType === 3) {
+            pending.push(node);
+          }
+        }
+      }
+      if (pending.length && !timer) {
+        timer = setTimeout(() => {
+          const batch = pending;
+          pending = [];
+          timer = null;
+          for (const node of batch) {
+            if (!node.isConnected) {
+              continue;
+            }
+            if (node.nodeType === 1) {
+              highlightRoot(node);
+            } else if (node.nodeType === 3) {
+              highlightTextNode(node);
+            }
+          }
+        }, 400);
+      }
+    });
+    hlObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  initHighlight().catch((e) => console.debug("[多语言查词助手] 高亮初始化失败", e));
+
+  // 供同一扩展的其它内容脚本(subtitle.js)复用查词卡片。
+  // 内容脚本共享同一个隔离世界的 window，所以直接挂在 window 上即可。
+  window.__namaDict = {
+    lookup: runLookup,
+    close: closeCard
+  };
 })();
