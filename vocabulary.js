@@ -1,326 +1,166 @@
-const state = {
-  entries: [],
-  currentList: [],
-  selected: new Set(),
-  lastIndex: -1
+const $ = (id) => document.getElementById(id);
+const h = (tag, props = {}, ...kids) => {
+  const el = Object.assign(document.createElement(tag), props);
+  el.append(...kids.filter((k) => k != null && k !== false));
+  return el;
 };
 
-const elements = {};
+const state = { entries: [], list: [], selected: new Set(), lastIndex: -1 };
+const starred = () => state.entries.filter((e) => e.starred);
 
 document.addEventListener("DOMContentLoaded", async () => {
-  bindElements();
-  bindEvents();
-  await loadEntries();
+  // 词条按词形分键存（w:<词>）；后台还没来得及迁移的老数据还在 entries 里
+  const all = await chrome.storage.local.get(null);
+  state.entries = all.entries || Object.keys(all).filter((k) => k.startsWith("w:")).flatMap((k) => all[k]);
+  for (const id of ["search-input", "language-filter", "time-filter", "export-filter", "sort-order"]) {
+    $(id).addEventListener(id === "search-input" ? "input" : "change", render);
+  }
+  $("export-csv").onclick = exportVisible;
+  $("select-all").onclick = () => {
+    state.list.forEach((e) => state.selected.add(e.id));
+    render();
+  };
+  $("select-clear").onclick = () => {
+    state.selected.clear();
+    state.lastIndex = -1;
+    render();
+  };
+  $("delete-selected").onclick = () => {
+    if (confirm(`确定删除选中的 ${state.selected.size} 条生词？`)) unstar([...state.selected]);
+  };
+  render();
 });
 
-function bindElements() {
-  elements.count = document.getElementById("vocab-count");
-  elements.searchInput = document.getElementById("search-input");
-  elements.languageFilter = document.getElementById("language-filter");
-  elements.timeFilter = document.getElementById("time-filter");
-  elements.exportFilter = document.getElementById("export-filter");
-  elements.sortOrder = document.getElementById("sort-order");
-  elements.exportButton = document.getElementById("export-csv");
-  elements.emptyState = document.getElementById("empty-state");
-  elements.list = document.getElementById("vocab-list");
-  elements.selectCount = document.getElementById("select-count");
-  elements.selectAll = document.getElementById("select-all");
-  elements.selectClear = document.getElementById("select-clear");
-  elements.deleteSelected = document.getElementById("delete-selected");
-}
-
-function bindEvents() {
-  elements.searchInput.addEventListener("input", render);
-  elements.languageFilter.addEventListener("change", render);
-  elements.timeFilter.addEventListener("change", render);
-  elements.exportFilter.addEventListener("change", render);
-  elements.sortOrder.addEventListener("change", render);
-  elements.exportButton.addEventListener("click", exportVisible);
-  elements.selectAll.addEventListener("click", selectAllVisible);
-  elements.selectClear.addEventListener("click", clearSelection);
-  elements.deleteSelected.addEventListener("click", deleteSelected);
-}
-
-async function loadEntries() {
-  const response = await sendRuntimeMessage({ type: "GET_ENTRIES" });
-  state.entries = response?.ok && Array.isArray(response.entries) ? response.entries : [];
-  renderLanguageFilter();
-  render();
-}
-
-function renderLanguageFilter() {
-  const languages = getStarredEntries()
-    .map((entry) => entry.lang)
-    .filter(Boolean)
-    .filter((lang, index, list) => list.indexOf(lang) === index)
-    .sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
-
-  const currentValue = elements.languageFilter.value;
-  elements.languageFilter.replaceChildren(createOption("", "全部语言"));
-
-  for (const lang of languages) {
-    elements.languageFilter.appendChild(createOption(lang, lang));
-  }
-
-  if (languages.includes(currentValue)) {
-    elements.languageFilter.value = currentValue;
-  }
-}
-
 function render() {
-  const query = elements.searchInput.value.trim().toLocaleLowerCase();
-  const language = elements.languageFilter.value;
-  const sortOrder = elements.sortOrder.value;
+  // 语言筛选项跟着生词本走，保留当前选择
+  const langFilter = $("language-filter");
+  const current = langFilter.value;
+  const langs = [...new Set(starred().map((e) => e.lang))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+  langFilter.replaceChildren(h("option", { value: "", textContent: "全部语言" }),
+    ...langs.map((l) => h("option", { value: l, textContent: l })));
+  langFilter.value = langs.includes(current) ? current : "";
 
-  state.currentList = getStarredEntries()
-    .filter((entry) => {
-      const matchesQuery = !query ||
-        entry.word.toLocaleLowerCase().includes(query) ||
-        entry.meaning.toLocaleLowerCase().includes(query);
-      const matchesLanguage = !language || entry.lang === language;
-      return matchesQuery && matchesLanguage &&
-        inTimeRange(entry.timestamp) && matchesExportStatus(entry);
-    })
-    .sort((a, b) => compareEntries(a, b, sortOrder));
+  const query = $("search-input").value.trim().toLocaleLowerCase();
+  const order = $("sort-order").value;
+  state.list = starred()
+    .filter((e) => (!query || e.word.toLocaleLowerCase().includes(query) || e.meaning.toLocaleLowerCase().includes(query)) &&
+      (!langFilter.value || e.lang === langFilter.value) && inTimeRange(e.timestamp) && matchesExport(e))
+    .sort((a, b) => order === "oldest" ? a.timestamp - b.timestamp
+      : order === "language" ? a.lang.localeCompare(b.lang, "zh-Hans-CN") || b.timestamp - a.timestamp
+        : b.timestamp - a.timestamp);
 
-  elements.count.textContent = `${getStarredEntries().length} 条生词`;
-  elements.emptyState.hidden = state.currentList.length > 0;
-  elements.list.replaceChildren(...state.currentList.map(createEntryNode));
-  updateSelectBar();
+  const ids = new Set(starred().map((e) => e.id));
+  for (const id of state.selected) if (!ids.has(id)) state.selected.delete(id);
+
+  $("vocab-count").textContent = `${ids.size} 条生词`;
+  $("empty-state").hidden = state.list.length > 0;
+  $("vocab-list").replaceChildren(...state.list.map(entryNode));
+  $("select-count").textContent = `已选 ${state.selected.size} 项`;
+  $("delete-selected").textContent = `删除选中 (${state.selected.size})`;
+  $("delete-selected").disabled = !state.selected.size;
 }
 
-function matchesExportStatus(entry) {
-  const filter = elements.exportFilter.value;
-  if (filter === "all") {
-    return true;
-  }
-  const exported = Number(entry.exportedAt) > 0;
-  return filter === "done" ? exported : !exported;
+function matchesExport(entry) {
+  const filter = $("export-filter").value;
+  return filter === "all" || (filter === "done") === entry.exportedAt > 0;
 }
 
 function inTimeRange(timestamp) {
-  const filter = elements.timeFilter.value;
-  if (filter === "all") {
-    return true;
-  }
-  const n = Number(timestamp);
-  if (!Number.isFinite(n) || n <= 0) {
-    return false;
-  }
+  const filter = $("time-filter").value;
+  if (filter === "all") return true;
   const now = new Date();
-  if (filter === "today") {
-    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    return n >= start;
-  }
-  const days = filter === "7d" ? 7 : 30;
-  return n >= now.getTime() - days * 86400000;
+  if (filter === "today") return timestamp >= new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  return timestamp >= now.getTime() - (filter === "7d" ? 7 : 30) * 864e5;
 }
 
-function updateSelectBar() {
-  const present = new Set(getStarredEntries().map((entry) => entry.id));
-  for (const id of Array.from(state.selected)) {
-    if (!present.has(id)) {
-      state.selected.delete(id);
-    }
-  }
-  const n = state.selected.size;
-  elements.selectCount.textContent = `已选 ${n} 项`;
-  elements.deleteSelected.textContent = `删除选中 (${n})`;
-  elements.deleteSelected.disabled = n === 0;
-}
-
-function handleCheck(index, shift) {
-  const list = state.currentList;
-  const id = list[index].id;
-  const turnOn = !state.selected.has(id);
-  if (shift && state.lastIndex >= 0) {
-    const a = Math.min(state.lastIndex, index);
-    const b = Math.max(state.lastIndex, index);
-    for (let i = a; i <= b; i += 1) {
-      const eid = list[i].id;
-      if (turnOn) {
-        state.selected.add(eid);
-      } else {
-        state.selected.delete(eid);
-      }
-    }
-  } else if (turnOn) {
-    state.selected.add(id);
-  } else {
-    state.selected.delete(id);
-  }
+// Shift 点复选框：选中/取消上次点的那条到这条之间的整段
+function toggleCheck(index, shift) {
+  const turnOn = !state.selected.has(state.list[index].id);
+  const [a, b] = shift && state.lastIndex >= 0
+    ? [Math.min(state.lastIndex, index), Math.max(state.lastIndex, index)]
+    : [index, index];
+  for (const e of state.list.slice(a, b + 1)) turnOn ? state.selected.add(e.id) : state.selected.delete(e.id);
   state.lastIndex = index;
   render();
 }
 
-function selectAllVisible() {
-  state.currentList.forEach((entry) => state.selected.add(entry.id));
-  render();
+function entryNode(entry, index) {
+  const row = (label, value) => h("div", { className: "detail-row" },
+    h("div", { className: "detail-label", textContent: label }),
+    h("div", { className: "detail-value", textContent: value || "暂无" }));
+
+  return h("details", { className: "vocab-item" },
+    h("summary", { className: "vocab-summary" },
+      h("input", {
+        type: "checkbox",
+        className: "vocab-check",
+        checked: state.selected.has(entry.id),
+        title: "选择（Shift 点击可选一段范围）",
+        onclick: (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          toggleCheck(index, event.shiftKey);
+        }
+      }),
+      h("div", { className: "vocab-main" },
+        h("div", { className: "word-line" },
+          h("span", { className: "word", textContent: entry.word }),
+          entry.translit && h("span", { className: "translit", textContent: entry.translit })),
+        h("div", { className: "meaning", textContent: entry.meaning || "暂无词义" }),
+        h("div", {},
+          h("span", { className: "lang-tag", textContent: entry.lang }),
+          h("span", { className: "vocab-date", textContent: `🗓 ${formatDate(entry.timestamp)}` }),
+          entry.exportedAt > 0 && h("span", { className: "vocab-exported", textContent: "✓ 已导出" }))),
+      h("div", { className: "vocab-actions" },
+        h("button", {
+          type: "button",
+          className: "danger-button",
+          textContent: "🗑 删除",
+          title: "从生词本移除",
+          onclick: (event) => {
+            event.preventDefault();
+            unstar([entry.id]);
+          }
+        }))),
+    h("div", { className: "details-body" },
+      row("完整词义", entry.meaning),
+      row("词源", entry.etymology),
+      row("句中作用", entry.form),
+      row("上下文", entry.context),
+      row("添加日期", formatDate(entry.timestamp, true))));
 }
 
-function clearSelection() {
-  state.selected.clear();
+async function unstar(ids) {
+  const res = await chrome.runtime.sendMessage({ type: "PATCH", items: state.entries.filter((e) => ids.includes(e.id)), patch: { starred: false } });
+  if (!res?.ok) return alert(res?.error?.message || "删除失败");
+  const set = new Set(ids);
+  for (const e of state.entries) if (set.has(e.id)) e.starred = false;
+  ids.forEach((id) => state.selected.delete(id));
   state.lastIndex = -1;
   render();
 }
 
-async function deleteSelected() {
-  if (!state.selected.size) {
-    return;
-  }
-  if (!window.confirm(`确定删除选中的 ${state.selected.size} 条生词？`)) {
-    return;
-  }
-  const ids = Array.from(state.selected);
-  const response = await sendRuntimeMessage({ type: "UNSTAR_MANY", ids });
-  if (!response?.ok) {
-    window.alert(response?.error?.message || "删除失败");
-    return;
-  }
-
-  const idSet = new Set(ids);
-  state.entries = state.entries.map((entry) => (
-    idSet.has(entry.id) ? { ...entry, starred: false } : entry
-  ));
-  state.selected.clear();
-  state.lastIndex = -1;
-  renderLanguageFilter();
-  render();
-}
-
-function createEntryNode(entry, index) {
-  const details = document.createElement("details");
-  details.className = "vocab-item";
-
-  const summary = document.createElement("summary");
-  summary.className = "vocab-summary";
-
-  const checkbox = document.createElement("input");
-  checkbox.type = "checkbox";
-  checkbox.className = "vocab-check";
-  checkbox.checked = state.selected.has(entry.id);
-  checkbox.title = "选择（Shift 点击可选一段范围）";
-  checkbox.addEventListener("click", (event) => {
-    event.stopPropagation();
-    event.preventDefault();
-    handleCheck(index, event.shiftKey);
-  });
-
-  const main = document.createElement("div");
-  main.className = "vocab-main";
-
-  const wordLine = document.createElement("div");
-  wordLine.className = "word-line";
-
-  const word = document.createElement("span");
-  word.className = "word";
-  word.textContent = entry.word;
-  wordLine.appendChild(word);
-
-  if (entry.translit) {
-    const translit = document.createElement("span");
-    translit.className = "translit";
-    translit.textContent = entry.translit;
-    wordLine.appendChild(translit);
-  }
-
-  const meaning = document.createElement("div");
-  meaning.className = "meaning";
-  meaning.textContent = entry.meaning || "暂无词义";
-
-  const metaLine = document.createElement("div");
-
-  const tag = document.createElement("span");
-  tag.className = "lang-tag";
-  tag.textContent = entry.lang || "未知语言";
-
-  const date = document.createElement("span");
-  date.className = "vocab-date";
-  date.textContent = `🗓 ${formatDateOnly(entry.timestamp)}`;
-
-  metaLine.append(tag, date);
-
-  if (Number(entry.exportedAt) > 0) {
-    const exported = document.createElement("span");
-    exported.className = "vocab-exported";
-    exported.textContent = "✓ 已导出";
-    metaLine.append(exported);
-  }
-
-  main.append(wordLine, meaning, metaLine);
-
-  const actions = document.createElement("div");
-  actions.className = "vocab-actions";
-
-  const deleteButton = document.createElement("button");
-  deleteButton.type = "button";
-  deleteButton.className = "danger-button";
-  deleteButton.textContent = "🗑 删除";
-  deleteButton.title = "从生词本移除";
-  deleteButton.addEventListener("click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    unstarEntry(entry.id);
-  });
-  actions.appendChild(deleteButton);
-
-  summary.append(checkbox, main, actions);
-
-  const body = document.createElement("div");
-  body.className = "details-body";
-  body.append(
-    createDetailRow("完整词义", entry.meaning || "暂无"),
-    createDetailRow("词源", entry.etymology || "暂无"),
-    createDetailRow("句中作用", entry.form || "暂无"),
-    createDetailRow("上下文", entry.context || "暂无"),
-    createDetailRow("添加日期", formatDateTime(entry.timestamp))
-  );
-
-  details.append(summary, body);
-  return details;
-}
-
-async function unstarEntry(id) {
-  const response = await sendRuntimeMessage({
-    type: "TOGGLE_STAR",
-    id,
-    starred: false
-  });
-
-  if (!response?.ok) {
-    window.alert(response?.error?.message || "删除失败");
-    return;
-  }
-
-  state.entries = state.entries.map((entry) => (
-    entry.id === id ? { ...entry, starred: false } : entry
-  ));
-  state.selected.delete(id);
-  renderLanguageFilter();
-  render();
-}
-
+// 所见即所导：导出当前列表（跟随搜索和全部筛选），导完标记为已导出
 async function exportVisible() {
-  // 所见即所导：导出当前列表（跟随 语言 + 时间 + 导出状态 + 搜索 筛选）。
-  const entries = state.currentList.slice();
-  if (entries.length === 0) {
-    window.alert("当前筛选/搜索范围没有可导出的生词。");
-    return;
-  }
+  const entries = state.list.slice();
+  if (!entries.length) return alert("当前筛选/搜索范围没有可导出的生词。");
 
-  downloadCsv(entries);
+  const field = (v) => `"${String(v ?? "").replace(/\r\n|\r|\n/g, "<br>").replace(/"/g, '""')}"`;
+  const lines = ["#separator:tab", "#html:true", "#tags column:3",
+    ...entries.map((e) => [frontHtml(e), backHtml(e), languageToTag(e.lang)].map(field).join("\t"))];
+  const link = h("a", {
+    href: URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/tab-separated-values;charset=utf-8" })),
+    download: `vocabulary_${formatDate(Date.now())}.csv`
+  });
+  link.click();
+  URL.revokeObjectURL(link.href);
 
-  // 标记为已导出，之后用"未导出"筛选即可只导新词。
-  const ids = entries.map((entry) => entry.id);
-  await sendRuntimeMessage({ type: "MARK_EXPORTED", ids });
-  const now = Date.now();
-  const idSet = new Set(ids);
-  state.entries = state.entries.map((entry) => (
-    idSet.has(entry.id) ? { ...entry, exportedAt: now } : entry
-  ));
+  const exportedAt = Date.now();
+  await chrome.runtime.sendMessage({ type: "PATCH", items: entries, patch: { exportedAt } });
+  entries.forEach((e) => (e.exportedAt = exportedAt));
   render();
 
-  window.alert(`CSV已导出（共 ${entries.length} 条，跟随当前筛选/搜索）。
+  alert(`CSV已导出（共 ${entries.length} 条，跟随当前筛选/搜索）。
 这些词已标记为"已导出"，下次用顶部"未导出"筛选即可只导新词。
 
 在Anki中导入步骤：
@@ -331,187 +171,50 @@ async function exportVisible() {
 5. 点击导入即可`);
 }
 
-function downloadCsv(entries) {
-  const lines = [
-    "#separator:tab",
-    "#html:true",
-    "#tags column:3",
-    ...entries.map((entry) => [
-      sanitizeCsvField(createFrontHtml(entry)),
-      sanitizeCsvField(createBackHtml(entry)),
-      sanitizeCsvField(languageToTag(entry.lang))
-    ].join("\t"))
-  ];
-  const blob = new Blob([lines.join("\n")], {
-    type: "text/tab-separated-values;charset=utf-8"
-  });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `vocabulary_${formatDate(new Date())}.csv`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+// 正面埋隐藏的词条 id，Anki 靠它去重
+function frontHtml(e) {
+  return `<div style="font-size:22px; line-height:1.6; padding:20px; text-align:center;">${markWord(e.context, e.word)}</div><span style="display:none">#${escapeHtml(e.id)}</span>`;
 }
 
-function createFrontHtml(entry) {
-  return `<div style="font-size:22px; line-height:1.6; padding:20px; text-align:center;">${highlightWord(entry.context, entry.word)}</div><span style="display:none">#${escapeHtml(entry.id || "")}</span>`;
-}
-
-function createBackHtml(entry) {
-  const highlightedContext = highlightWord(entry.context, entry.word);
+function backHtml(e) {
   return `<div style="font-size:18px; line-height:1.8; padding:20px;">
   <div style="font-size:20px; text-align:center; margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid #ddd;">
-    ${highlightedContext}
+    ${markWord(e.context, e.word)}
   </div>
-  <div style="margin:8px 0;">📖 <b>${escapeHtml(entry.translit)}</b></div>
-  <div style="margin:8px 0;">💡 ${escapeHtml(entry.meaning)}</div>
-  <div style="margin:8px 0;">🌱 ${escapeHtml(entry.etymology)}</div>
-  <div style="margin:8px 0;">📍 ${escapeHtml(entry.form)}</div>
+  <div style="margin:8px 0;">📖 <b>${escapeHtml(e.translit)}</b></div>
+  <div style="margin:8px 0;">💡 ${escapeHtml(e.meaning)}</div>
+  <div style="margin:8px 0;">🌱 ${escapeHtml(e.etymology)}</div>
+  <div style="margin:8px 0;">📍 ${escapeHtml(e.form)}</div>
 </div>`;
 }
 
-function highlightWord(context, word) {
-  const text = String(context || word || "");
-  const target = String(word || "");
-  const index = findTargetWordIndex(text, target);
-
-  if (!target || index < 0) {
-    return escapeHtml(text);
-  }
-
-  return [
-    escapeHtml(text.slice(0, index)),
-    `<b style="color:#d97706;">${escapeHtml(text.slice(index, index + target.length))}</b>`,
-    escapeHtml(text.slice(index + target.length))
-  ].join("");
-}
-
-function findTargetWordIndex(text, word) {
-  if (!word) {
-    return -1;
-  }
-
-  let index = text.indexOf(word);
-  const firstOccurrence = index;
-  while (index >= 0) {
-    const before = text[index - 1] || "";
-    const after = text[index + word.length] || "";
-    if (isWordBoundary(before) && isWordBoundary(after)) {
-      return index;
-    }
-    index = text.indexOf(word, index + word.length);
-  }
-
-  // 没有"整词边界"匹配时，退回首次出现的位置，避免该高亮却不高亮。
-  return firstOccurrence;
-}
-
-function isWordBoundary(char) {
-  return !char || /[\s\u200c.,،，;؛:：!?؟۔。！？"'“”‘’«»《》（）()[\]{}<>]/u.test(char);
-}
-
-function createDetailRow(label, value) {
-  const row = document.createElement("div");
-  row.className = "detail-row";
-
-  const labelNode = document.createElement("div");
-  labelNode.className = "detail-label";
-  labelNode.textContent = label;
-
-  const valueNode = document.createElement("div");
-  valueNode.className = "detail-value";
-  valueNode.textContent = value;
-
-  row.append(labelNode, valueNode);
-  return row;
-}
-
-function createOption(value, label) {
-  const option = document.createElement("option");
-  option.value = value;
-  option.textContent = label;
-  return option;
-}
-
-function compareEntries(a, b, sortOrder) {
-  if (sortOrder === "oldest") {
-    return a.timestamp - b.timestamp;
-  }
-
-  if (sortOrder === "language") {
-    return a.lang.localeCompare(b.lang, "zh-Hans-CN") || b.timestamp - a.timestamp;
-  }
-
-  return b.timestamp - a.timestamp;
-}
-
-function getStarredEntries() {
-  return state.entries.filter((entry) => entry.starred);
-}
-
-function sanitizeCsvField(value) {
-  // 标准 CSV 转义：整段用双引号包裹，内部双引号写成两个，换行转 <br>。
-  // 否则字段里 HTML 的 style="..." 引号会让 Anki 误判边界，导致上下文/词语丢失。
-  const text = String(value ?? "").replace(/\r\n|\r|\n/g, "<br>");
-  return `"${text.replace(/"/g, '""')}"`;
+// 上下文里把生词加粗：优先整词边界的那次出现，找不到就用第一次出现
+function markWord(context, word) {
+  const text = context || word;
+  const boundary = /[\s\u200C.,،，;؛:：!?؟۔。！？"'“”‘’«»《》（）()[\]{}<>]/u;
+  const isEdge = (ch) => !ch || boundary.test(ch);
+  let i = word ? text.indexOf(word) : -1;
+  const first = i;
+  while (i >= 0 && !(isEdge(text[i - 1]) && isEdge(text[i + word.length]))) i = text.indexOf(word, i + word.length);
+  if (i < 0) i = first;
+  if (i < 0) return escapeHtml(text);
+  return `${escapeHtml(text.slice(0, i))}<b style="color:#d97706;">${escapeHtml(word)}</b>${escapeHtml(text.slice(i + word.length))}`;
 }
 
 function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  return String(value ?? "").replace(/[&<>"']/g, (c) => map[c]);
 }
 
 function languageToTag(lang) {
-  const tags = {
-    波斯语: "Persian",
-    俄语: "Russian",
-    阿拉伯语: "Arabic",
-    土耳其语: "Turkish"
-  };
+  const tags = { 波斯语: "Persian", 俄语: "Russian", 阿拉伯语: "Arabic", 土耳其语: "Turkish" };
   return tags[lang] || String(lang || "Unknown").trim().replace(/\s+/g, "_");
 }
 
-function formatDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function formatDateOnly(timestamp) {
-  const n = Number(timestamp);
-  if (!Number.isFinite(n) || n <= 0) {
-    return "未知日期";
-  }
-  return formatDate(new Date(n));
-}
-
-function formatDateTime(timestamp) {
-  const n = Number(timestamp);
-  if (!Number.isFinite(n) || n <= 0) {
-    return "未知日期";
-  }
-  const date = new Date(n);
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  return `${formatDate(date)} ${hh}:${mm}`;
-}
-
-function sendRuntimeMessage(payload) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(payload, (response) => {
-      const error = chrome.runtime.lastError;
-      if (error) {
-        reject(new Error(error.message));
-        return;
-      }
-      resolve(response);
-    });
-  });
+function formatDate(timestamp, withTime = false) {
+  if (!(timestamp > 0)) return "未知日期";
+  const d = new Date(timestamp);
+  const pad = (n) => String(n).padStart(2, "0");
+  const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return withTime ? `${date} ${pad(d.getHours())}:${pad(d.getMinutes())}` : date;
 }

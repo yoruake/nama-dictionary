@@ -1,944 +1,321 @@
-const API_ENDPOINT = "https://api.deepseek.com/v1/chat/completions";
-const MODEL = "deepseek-v4-flash";
-const API_TIMEOUT_MS = 60000;
-const API_KEY_STORAGE_KEY = "deepseekApiKey";
-const ENTRIES_STORAGE_KEY = "entries";
-const LEGACY_CACHE_STORAGE_KEY = "lookupCache";
+importScripts("langs.js");
 
-const SYSTEM_PROMPT = `你是多语言查词助手。给你一个词(或词组/句子)及其上下文，按下面纯文本格式逐行输出：每字段独占一行、以英文标签开头、尽量短，不用markdown、不加多余说明。
+const API = "https://api.deepseek.com/chat/completions";
+// DeepSeek-V4.1-Flash（2026-09-10 起）。旧名 deepseek-v4-flash 对应的模型已退役，只是临时转发过来。
+const MODEL = "deepseek-flash";
+const CACHE_DAYS = 183;   // 未收藏的查词缓存保留半年
 
-WORD: 原词
-PRON: 读音注音，只给「正文语言」的读音(正文语言=选区周围上下文所用、读者正在读的语言)——即读者会怎么读这个词，不要给它在原语/来源语言里的读音。注音体系随正文语言：中文带声调拼音／日语黑本式罗马音(可附假名)／韩语罗马字／印地·梵·巴利用IAST／俄波阿土等用IPA(方括号+重音ˈ)。
-LANG: 该词本身所属或来源的语言(中文名)；借词可写「X语(源自Y语)」。
-MEANING: 核心词义(中文,1-2个义项)
-ETYMOLOGY: 词源一句话(可提原语来源)
-FORM: 形态与句法作用；变体形式先给原形和形态再说语法成分，原形则直接说特征。
+const SYSTEM_PROMPT = `你是多语言查词助手。输入是要查的词（或词组、句子）、它所在的句子，有时还给出「正文语言」。按下面格式逐行输出纯文本：每个字段一行、英文标签开头、尽量简短，不用 markdown，不加任何说明。
 
-先据上下文定「正文语言」以决定用哪种读音，按共享文字/借词分圈：
-- 汉字圈(中/日/韩/越)：含假名→日语(罗马音)、含谚文→韩语、纯汉字合中文语境→中文(拼音)；中文里的日本/韩国人名地名一律给拼音，不给日/韩读音
-- 梵/巴利借词(佛教等)：中日文佛教术语按正文读(拼音/罗马音)，梵/巴利来源只放进 ETYMOLOGY、不作读音
-- 阿拉伯字母圈(阿/波斯/乌尔都/奥斯曼/维吾尔/库尔德)：按上下文与词汇定正文语言，给该语言读音
-- 西里尔圈(俄/乌/保/塞/哈萨克/蒙古)：同形字母不同读音，按正文语言
-- 拉丁圈(英/法/德/意/西/土耳其/越南等)：同拼写跨语言，按正文语言与上下文
-- 专名通则：人名地名跨语言保字形/拼写，按正文语言读(读者怎么读)
-用IPA的语言，不标短元音的文字按标准音补全(波斯语德黑兰音 æ/e/o、ɒː/iː/uː)并标重音ˈ。`;
+LANG: 该词在这段正文里所属的语言，只写中文语言名（如 波斯语）；借词来源写进 ETYMOLOGY
+PRON: 读音，规则见下
+MEANING: 本句中的词义（中文，1-2 个义项）
+ETYMOLOGY: 词源，一句话
+FORM: 形态与句法作用；变形词先给原形和形态，再说在句中作什么成分
 
-const storageReady = initializeEntriesStorage().catch((error) => {
-  console.error("[多语言查词助手] 存储初始化失败", error);
+一、定正文语言
+- 给了「正文语言」就一律按它分析读音、词义、形态，不要改判成相近语言。
+- 没给就据上下文判断。同文字的近亲语言靠拼写特征和周围词汇区分：波斯/达利/塔吉克、阿拉伯/波斯/乌尔都、俄/乌克兰/哈萨克/塔吉克（西里尔）、土耳其/阿塞拜疆。
+- 汉字：含假名为日语，含谚文为韩语，否则按中文。
+
+二、PRON：只写读者在正文语言里怎么读，不写来源语言的读音（梵语、阿拉伯语等来源放进 ETYMOLOGY）。人名地名也按正文语言读；中文里的日韩人名地名给拼音。
+- 中文：带声调拼音。日语：平文式罗马字，可附假名。韩语：文观部罗马字。梵语、巴利语、印地语：IAST。
+- 其他语言：先写标出元音和重音的形式，空一格再写方括号 IPA，重读音节前标 ˈ。先定元音和重音再转 IPA，不要逐字母硬转：
+  俄语 кни́ги [ˈknʲiɡʲɪ]：按词形变化定重音；非重读 о/а 弱化为 ɐ/ə，е/я 为 ɪ；词末浊辅音清化；软辅音标 ʲ
+  波斯语 ketāb [keˈtɒːb]：补全不写出的短元音；德黑兰音 æ e o / ɒː iː uː；耶扎菲读出 -e/-ye；名词、形容词重音在末音节，动词前缀 mi-/ne-/be- 带重音。达利语用喀布尔音
+  阿拉伯语 al-kutubu [al.ˈku.tu.bu]：补全短元音，按句法补格尾，句末停顿形不读格尾
+  德语 gegangen [ɡəˈɡaŋən]`;
+
+chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
+
+// ===== 存储：每个词形一个键 "w:<小写词>" → 这个词形的所有词条 =====
+// 0.8 及以前整本词库存在一个 entries 键里（用户的有 6000+ 条、近 3MB），每查一次词要整读整写两三遍，
+// 光是从缓存里拿一个查过的词就要 200–500ms。页内高亮只要收藏的词，单独存一份 starredWords。
+const wkey = (word) => "w:" + squash(word).toLocaleLowerCase();
+
+// 读-改-写一律排队，避免并发互相覆盖
+let queue = Promise.resolve();
+function serial(fn) {
+  const run = queue.then(fn);
+  queue = run.catch(() => {});
+  return run;
+}
+
+// 改一个词形下的词条：fn 原地改数组（或返回新数组），改空了就删键
+function updateWord(word, fn) {
+  return serial(async () => {
+    const k = wkey(word);
+    const { [k]: list = [] } = await chrome.storage.local.get(k);
+    const next = fn(list) || list;
+    await (next.length ? chrome.storage.local.set({ [k]: next }) : chrome.storage.local.remove(k));
+  });
+}
+
+// 旧版 entries 一次性拆成每词一个键；之后每次 service worker 启动这里只是查一下没有 entries 键
+const ready = serial(async () => {
+  const { entries } = await chrome.storage.local.get("entries");
+  if (!entries) return;
+  const out = {};
+  for (const e of entries) (out[wkey(e.word)] ||= []).push(e);
+  out.starredWords = [...new Set(entries.filter((e) => e.starred).map((e) => squash(e.word).toLocaleLowerCase()))];
+  await chrome.storage.local.set(out);
+  await chrome.storage.local.remove("entries");
 });
 
-chrome.action.onClicked.addListener(() => {
-  chrome.runtime.openOptionsPage();
-});
+// 只留 keep 为真的词条（清空缓存 / 过期清理），只在用户点清空或浏览器启动时跑
+function prune(keep) {
+  return serial(async () => {
+    const all = await chrome.storage.local.get(null);
+    const set = {};
+    const del = [];
+    for (const [k, list] of Object.entries(all)) {
+      if (!k.startsWith("w:")) continue;
+      const left = list.filter(keep);
+      if (!left.length) del.push(k);
+      else if (left.length < list.length) set[k] = left;
+    }
+    await chrome.storage.local.remove(del);
+    await chrome.storage.local.set(set);
+  });
+}
+const expire = () => prune((e) => e.starred || e.timestamp >= Date.now() - CACHE_DAYS * 864e5);
+chrome.runtime.onStartup.addListener(expire);
+chrome.runtime.onInstalled.addListener(() => ready.then(expire));
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  handleMessage(message, sender)
-    .then((response) => sendResponse(response))
-    .catch((error) => {
-      console.error("[多语言查词助手] 未处理错误", error);
-      sendResponse({
-        ok: false,
-        error: serializeError(error)
-      });
-    });
-
+chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+  handle(msg).then(reply, (e) => reply({ ok: false, error: errInfo(e) }));
   return true;
 });
 
-// 流式查词：边生成边把已有字段推给卡片，不用等六个字段全部写完。
-// 之所以走 Port 而不是 sendMessage，是因为一次请求要回传很多次。
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "nama-lookup") {
-    return;
-  }
-  port.onMessage.addListener((message) => {
-    if (message && message.type === "LOOKUP_STREAM") {
-      streamLookup(port, message).catch((error) => {
-        safePost(port, { type: "error", error: serializeError(error) });
-      });
+async function handle(msg) {
+  switch (msg?.type) {
+    case "PATCH": {   // 收藏 / 取消收藏 / 标记已导出；items: [{ id, word }]，按 word 找键
+      await ready;
+      const ids = new Set(msg.items.map((x) => x.id));
+      const words = [...new Set(msg.items.map((x) => x.word))];
+      for (const w of words) await updateWord(w, (es) => { for (const e of es) if (ids.has(e.id)) Object.assign(e, msg.patch); });
+      if ("starred" in msg.patch) await serial(() => syncStarred(words));
+      return { ok: true };
     }
-  });
-});
-
-function safePost(port, payload) {
-  try {
-    port.postMessage(payload);
-    return true;
-  } catch (error) {
-    return false;   // 卡片已经关了，端口断开
-  }
-}
-
-async function streamLookup(port, message) {
-  const word = normalizeInput(message.word);
-  const context = normalizeContext(message.sentence || word);
-
-  if (!word) {
-    safePost(port, { type: "error", error: { type: "bad_request", message: "未检测到可查询的单词" } });
-    return;
-  }
-
-  const entries = await getEntries();
-  const cached = findCachedEntry(entries, word, context) || findEntryByWord(entries, word);
-  if (cached) {
-    safePost(port, { type: "done", cached: true, id: cached.id, data: cached });
-    return;
-  }
-
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    safePost(port, {
-      type: "error",
-      error: { type: "missing_key", message: "请先在扩展设置中配置DeepSeek API Key" }
-    });
-    return;
-  }
-
-  let lastPostAt = 0;
-  const full = await streamDeepSeek(apiKey, word, context, (text) => {
-    const now = Date.now();
-    if (now - lastPostAt < 80) {
-      return;   // 限流，别把消息通道打满
-    }
-    lastPostAt = now;
-    safePost(port, { type: "partial", data: parseAnalysis(text, word) });
-  });
-
-  const entry = createEntry(parseAnalysis(full, word), word, context);
-  const fresh = await getEntries();
-  fresh.push(entry);
-  await saveEntries(fresh);
-
-  safePost(port, { type: "done", cached: false, id: entry.id, data: entry });
-}
-
-async function handleMessage(message) {
-  if (!message || typeof message.type !== "string") {
-    return createFailure("bad_request", "请求格式不正确");
-  }
-
-  switch (message.type) {
-    case "LOOKUP_WORD":
-      return lookupWord(message);
-    case "REANALYZE_FORM":
-      return reanalyzeForm(message);
-    case "TOGGLE_STAR":
-      return toggleStar(message);
-    case "UNSTAR_MANY":
-      return unstarMany(message);
-    case "MARK_EXPORTED":
-      return markExported(message);
-    case "GET_ENTRIES":
-      return getEntriesForPage();
-    case "TEST_API_KEY":
-      return testApiKey(message);
-    case "GET_CACHE_STATS":
-      return getCacheStats();
-    case "CLEAR_CACHE":
-      return clearCache();
+    case "CLEAR":
+      await ready;
+      await prune((e) => e.starred);
+      return { ok: true };
+    case "TEST_KEY":
+      return { ok: true, data: parse(await ask(msg.apiKey, msg.word, `测试词：${msg.word}`, "")) };
     case "OPEN_OPTIONS":
       await chrome.runtime.openOptionsPage();
       return { ok: true };
-    default:
-      return createFailure("bad_request", "未知请求类型");
   }
+  return { ok: false, error: { message: "未知请求" } };
 }
 
-async function lookupWord(message) {
-  const word = normalizeInput(message.word);
-  const context = normalizeContext(message.sentence || word);
+// ===== 查词：走 Port，边生成边把已有字段推给卡片 =====
+// 卡片中途关掉也照样生成完、存下来（下次再查直接出缓存），只是不再推给卡片
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "nama-lookup") return;
+  port.onMessage.addListener((msg) => lookup(port, msg)
+    .catch((e) => post(port, { error: errInfo(e) }))
+    .finally(() => port.disconnect()));
+});
 
-  if (!word) {
-    return createFailure("bad_request", "未检测到可查询的单词");
+function post(port, msg) {
+  try { port.postMessage(msg); } catch {}   // 卡片已关
+}
+
+// 这几个词形还有没有收藏的词条，同步进 starredWords（页内高亮用）
+async function syncStarred(words) {
+  const keys = words.map(wkey);
+  const got = await chrome.storage.local.get([...keys, "starredWords"]);
+  const set = new Set(got.starredWords || []);
+  for (const k of keys) (got[k] || []).some((e) => e.starred) ? set.add(k.slice(2)) : set.delete(k.slice(2));
+  await chrome.storage.local.set({ starredWords: [...set] });
+}
+
+async function lookup(port, { word, sentence, fresh, id }) {
+  word = squash(word);
+  const context = squash(sentence) || word;
+  if (!word) throw err("bad_request", "没有选中可查的文字");
+
+  await ready;
+  const k = wkey(word);
+  const { [k]: list = [], deepseekApiKey, readLang = "" } =
+    await chrome.storage.local.get([k, "deepseekApiKey", "readLang"]);
+  const lock = langKey(readLang);
+
+  if (!fresh) {
+    const hit = findEntry(list, word, lock);
+    if (hit) return post(port, { done: true, data: hit, lock });
   }
+  if (!deepseekApiKey) throw err("missing_key", "请先在扩展设置里填 DeepSeek API Key");
 
-  const entries = await getEntries();
-  const cached = findCachedEntry(entries, word, context);
-
-  if (cached && message.useCache !== false) {
-    return {
-      ok: true,
-      cached: true,
-      id: cached.id,
-      data: cached
-    };
-  }
-
-  // 回退：同一个词（不论上下文）已在本地/生词本中 → 复用它，避免重复调用 API、
-  // 避免建重复条目，也让已收藏的词被再次选中后能直接取消收藏。
-  if (message.useCache !== false) {
-    const byWord = findEntryByWord(entries, word);
-    if (byWord) {
-      return {
-        ok: true,
-        cached: true,
-        id: byWord.id,
-        data: byWord
-      };
+  // 词典读音和模型并行：锁了语言就立刻查，否则等模型吐出 LANG 行再查
+  let dict = lock ? dictIpa(word, lock) : null;
+  let lastPost = 0;
+  const text = await ask(deepseekApiKey, word, context, lock, (partial) => {
+    const data = parse(partial, lock);
+    if (!dict && LANGS[langKey(data.lang)]) dict = dictIpa(word, data.lang);
+    if (Date.now() - lastPost > 80) {   // 限流，别把消息通道打满
+      lastPost = Date.now();
+      post(port, { data, lock });
     }
-  }
+  });
 
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    return createFailure("missing_key", "请先在扩展设置中配置DeepSeek API Key");
-  }
+  // 模型一写完就存、就出结果，不等词典
+  const data = parse(text, lock);
+  const fields = { ...data, ipaDict: false, lang: data.lang || "未知语言", context, timestamp: Date.now() };
+  let entry;
+  await updateWord(word, (es) => {
+    // 重新分析：沿用原条目的 id、原文词形（页内高亮靠它匹配）、收藏和导出状态
+    const i = id ? es.findIndex((e) => e.id === id) : -1;
+    if (i >= 0) entry = es[i] = { ...es[i], ...fields };
+    else es.push(entry = { id: crypto.randomUUID(), word, ...fields, starred: false, exportedAt: 0 });
+  });
+  post(port, { done: true, data: entry, lock });
 
-  const data = await queryDeepSeek(apiKey, word, context);
-  const entry = createEntry(data, word, context);
-  entries.push(entry);
-  await saveEntries(entries);
-
-  return {
-    ok: true,
-    cached: false,
-    id: entry.id,
-    data: entry
-  };
+  // 词典读音到了再补上；这期间要是又重新分析过，就不拿旧的覆盖
+  const ipa = pickIpa(await (dict || dictIpa(word, data.lang)), data.translit);
+  if (!ipa) return;
+  const patch = { translit: ipa, ipaDict: true };
+  await updateWord(word, (es) => {
+    const e = es.find((x) => x.id === entry.id);
+    if (e?.timestamp === entry.timestamp) Object.assign(e, patch);
+  });
+  post(port, { patch });
 }
 
-async function reanalyzeForm(message) {
-  const word = normalizeInput(message.word);
-  const context = normalizeContext(message.sentence || word);
-
-  if (!word) {
-    return createFailure("bad_request", "未检测到可查询的单词");
-  }
-
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    return createFailure("missing_key", "请先在扩展设置中配置DeepSeek API Key");
-  }
-
-  const entries = await getEntries();
-  const entryIndex = findEntryIndex(entries, message.id, word, context);
-  const cached = entryIndex >= 0 ? entries[entryIndex] : null;
-
-  const fresh = await queryDeepSeek(apiKey, word, context);
-  const merged = {
-    id: cached?.id || generateId(),
-    // 保留原文词形，避免重新分析后与页面文字对不上导致高亮失效
-    word: cached?.word || word || fresh.word,
-    translit: fresh.translit || cached?.translit || "",
-    etymology: fresh.etymology || cached?.etymology || "",
-    meaning: fresh.meaning || cached?.meaning || "",
-    form: fresh.form || cached?.form || "",
-    lang: fresh.lang || cached?.lang || "未知语言",
-    context,
-    timestamp: Date.now(),
-    starred: Boolean(cached?.starred),
-    exportedAt: normalizeExportedAt(cached?.exportedAt)
-  };
-
-  if (entryIndex >= 0) {
-    entries[entryIndex] = merged;
-  } else {
-    entries.push(merged);
-  }
-  await saveEntries(entries);
-
-  return {
-    ok: true,
-    cached: false,
-    id: merged.id,
-    data: merged
-  };
+// 同词：已收藏的优先，其次最近分析的（所以重新分析后再查就是新结果）；锁了语言只认该语言
+function findEntry(entries, word, lock) {
+  const key = word.toLocaleLowerCase();
+  return entries
+    .filter((e) => e.word.toLocaleLowerCase() === key && (!lock || e.lang.startsWith(lock)))
+    .sort((a, b) => b.starred - a.starred || b.timestamp - a.timestamp)[0];
 }
 
-async function toggleStar(message) {
-  const entries = await getEntries();
-  const id = normalizeInput(message.id);
-  const index = entries.findIndex((entry) => entry.id === id);
-
-  if (index < 0) {
-    return createFailure("not_found", "未找到这条查询记录");
-  }
-
-  const nextStarred = typeof message.starred === "boolean"
-    ? message.starred
-    : !entries[index].starred;
-
-  entries[index] = {
-    ...entries[index],
-    starred: nextStarred
-  };
-  await saveEntries(entries);
-
-  return {
-    ok: true,
-    data: entries[index]
-  };
-}
-
-async function getEntriesForPage() {
-  const entries = await getEntries();
-  return {
-    ok: true,
-    entries
-  };
-}
-
-async function markExported(message) {
-  const ids = Array.isArray(message.ids)
-    ? message.ids.map(normalizeInput).filter(Boolean)
-    : [];
-  if (!ids.length) {
-    return { ok: true, count: 0 };
-  }
-
-  const idSet = new Set(ids);
-  const entries = await getEntries();
-  const now = Date.now();
-  let count = 0;
-
-  for (const entry of entries) {
-    if (idSet.has(entry.id)) {
-      entry.exportedAt = now;
-      count += 1;
-    }
-  }
-
-  await saveEntries(entries);
-  return { ok: true, count };
-}
-
-async function unstarMany(message) {
-  const ids = Array.isArray(message.ids)
-    ? message.ids.map(normalizeInput).filter(Boolean)
-    : [];
-  if (!ids.length) {
-    return { ok: true, count: 0 };
-  }
-
-  const idSet = new Set(ids);
-  const entries = await getEntries();
-  let count = 0;
-
-  for (const entry of entries) {
-    if (idSet.has(entry.id) && entry.starred) {
-      entry.starred = false;
-      count += 1;
-    }
-  }
-
-  await saveEntries(entries);
-  return { ok: true, count };
-}
-
-async function testApiKey(message) {
-  const apiKey = normalizeInput(message.apiKey);
-  const word = normalizeInput(message.word) || "سلام";
-  const sentence = normalizeInput(message.sentence) || `测试词：${word}`;
-
-  if (!apiKey) {
-    return createFailure("missing_key", "请先输入DeepSeek API Key");
-  }
-
-  const data = await queryDeepSeek(apiKey, word, sentence);
-  return {
-    ok: true,
-    data
-  };
-}
-
-async function getCacheStats() {
-  const entries = await getEntries();
-  return {
-    ok: true,
-    count: entries.length,
-    starredCount: entries.filter((entry) => entry.starred).length
-  };
-}
-
-async function clearCache() {
-  const entries = await getEntries();
-  const preservedEntries = entries.filter((entry) => entry.starred);
-  await saveEntries(preservedEntries);
-  await removeStorage([LEGACY_CACHE_STORAGE_KEY]);
-  return {
-    ok: true,
-    count: preservedEntries.length,
-    starredCount: preservedEntries.length
-  };
-}
-
-async function streamDeepSeek(apiKey, word, sentence, onText) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-
+async function ask(apiKey, word, sentence, lock, onText = () => {}) {
   try {
-    const response = await fetch(API_ENDPOINT, {
+    const res = await fetch(API, {
       method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
+      signal: AbortSignal.timeout(60000),
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: MODEL,
+        thinking: { type: "disabled" },   // 默认开思考，查一个词要等好几秒
         temperature: 0.2,
-        thinking: { type: "disabled" },
-        max_tokens: 300,
+        max_tokens: 400,
         stream: true,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: `单词：${word}\n句子：${sentence}` }
+          { role: "user", content: `${lock ? `正文语言：${lock}\n` : ""}单词：${word}\n句子：${sentence}` }
         ]
       })
     });
+    if (!res.ok) throw apiError(res.status, await res.text());
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw buildApiError(response.status, parseApiResponseBody(errorText), errorText);
-    }
-    if (!response.body) {
-      const error = new Error("网络错误，请重试");
-      error.type = "network";
-      throw error;
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = "";
-    let full = "";
-
+    let text = "";
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-
-      let newline;
-      while ((newline = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (!line.startsWith("data:")) {
-          continue;
-        }
+      if (done) break;
+      const lines = (buffer + value).split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
         const payload = line.slice(5).trim();
-        if (!payload || payload === "[DONE]") {
-          continue;
-        }
-        try {
-          const chunk = JSON.parse(payload);
-          const delta = chunk?.choices?.[0]?.delta?.content;
-          if (delta) {
-            full += delta;
-            onText(full);
-          }
-        } catch (error) {
-          // SSE 被切在半截 JSON 上，等下一片
-        }
+        if (!line.startsWith("data:") || payload === "[DONE]") continue;
+        const delta = JSON.parse(payload).choices?.[0]?.delta?.content;
+        if (delta) onText(text += delta);
       }
     }
-
-    if (!full.trim()) {
-      const error = new Error("解析失败");
-      error.type = "invalid_json";
-      throw error;
-    }
-
-    return full;
-  } catch (error) {
-    if (error.name === "AbortError") {
-      const timeoutError = new Error("请求超时，请重试");
-      timeoutError.type = "timeout";
-      throw timeoutError;
-    }
-    if (error.type) {
-      throw error;
-    }
-    const networkError = new Error("网络错误，请重试");
-    networkError.type = "network";
-    throw networkError;
-  } finally {
-    clearTimeout(timeoutId);
+    if (!text.trim()) throw err("empty", "模型没有返回内容，请重试");
+    return text;
+  } catch (e) {
+    if (e.type) throw e;
+    if (e.name === "TimeoutError") throw err("timeout", "请求超时，请重试");
+    throw err("network", "网络错误，请重试");
   }
 }
 
-async function queryDeepSeek(apiKey, word, sentence) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(API_ENDPOINT, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0.2,
-        // 关闭思考模式（v4 默认开启，会显著变慢甚至超时）
-        thinking: { type: "disabled" },
-        // 字段本就短，限个上限防跑长、稳住速度
-        max_tokens: 300,
-        messages: [
-          {
-            role: "system",
-            content: SYSTEM_PROMPT
-          },
-          {
-            role: "user",
-            content: `单词：${word}\n句子：${sentence}`
-          }
-        ]
-      })
-    });
-
-    const responseText = await response.text();
-    const payload = parseApiResponseBody(responseText);
-
-    if (!response.ok) {
-      throw buildApiError(response.status, payload, responseText);
-    }
-
-    const content = payload?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || !content.trim()) {
-      const error = new Error("解析失败");
-      error.type = "invalid_json";
-      error.rawResponse = responseText;
-      throw error;
-    }
-
-    return parseAnalysis(content, word);
-  } catch (error) {
-    if (error.name === "AbortError") {
-      const timeoutError = new Error("请求超时，请重试");
-      timeoutError.type = "timeout";
-      throw timeoutError;
-    }
-
-    if (error.type) {
-      throw error;
-    }
-
-    const networkError = new Error("网络错误，请重试");
-    networkError.type = "network";
-    networkError.originalMessage = error.message;
-    throw networkError;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-// 解析逐行标签格式（WORD/PRON/LANG/MEANING/ETYMOLOGY/FORM）；兼容旧 JSON 输出。
-function parseAnalysis(text, fallbackWord) {
-  const field = (key) => {
-    const match = text.match(new RegExp("^[\\s>*\\-]*" + key + "\\s*[:：]\\s*(.+)$", "im"));
-    return match ? toShortString(match[1]) : "";
+function parse(text, lock) {
+  const field = (tag) => squash(text.match(new RegExp(`^[\\s>*-]*${tag}\\**\\s*[:：]\\s*(.+)$`, "im"))?.[1]);
+  return {
+    lang: lock || field("LANG"),
+    translit: field("PRON"),
+    meaning: field("MEANING"),
+    etymology: field("ETYMOLOGY"),
+    form: field("FORM")
   };
+}
 
-  let word = field("WORD");
-  let translit = field("PRON") || field("IPA");
-  let lang = field("LANG");
-  let meaning = field("MEANING");
-  let etymology = field("ETYMOLOGY");
-  let form = field("FORM");
-
-  if (!word && !meaning && text.indexOf("{") !== -1) {
+// ===== 词典读音：Wiktionary（kaikki.org 逐词 JSONL），只查单个词 =====
+async function dictIpa(word, lang) {
+  const name = LANGS[langKey(lang)];
+  if (!name || /\s/.test(word)) return [];
+  // 词典页标题不带课本式重音符和阿拉伯语元音符号
+  const bare = word.normalize("NFC").replace(/[\u0300\u0301\u064B-\u065F\u0670]/g, "");
+  const signal = AbortSignal.timeout(4000);
+  const get = async (w) => {
+    const c = Array.from(w);
+    const path = [name, "meaning", c[0], c.slice(0, 2).join(""), `${w}.jsonl`].map(encodeURIComponent).join("/");
     try {
-      const obj = extractJson(text);
-      word = toShortString(obj.word) || word;
-      translit = toShortString(obj.translit) || translit;
-      lang = toShortString(obj.lang) || lang;
-      meaning = toShortString(obj.meaning) || meaning;
-      etymology = toShortString(obj.etymology) || etymology;
-      form = toShortString(obj.form || obj.role) || form;
+      const res = await fetch(`https://kaikki.org/dictionary/${path}`, { signal });
+      if (!res.ok) return [];
+      return (await res.text()).split("\n").filter(Boolean)
+        .flatMap((line) => JSON.parse(line).sounds || [])
+        .map((s) => s.ipa)
+        .filter((ipa) => ipa && !ipa.includes("-"));   // 去掉「/ɹə-/」这类残片
     } catch {
-      // 忽略半截 JSON
-    }
-  }
-
-  return {
-    word: word || fallbackWord,
-    lang,
-    translit,
-    meaning,
-    etymology,
-    form
-  };
-}
-
-function extractJson(text) {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end <= start) {
-    return {};
-  }
-  return JSON.parse(text.slice(start, end + 1));
-}
-
-function parseApiResponseBody(responseText) {
-  try {
-    return JSON.parse(responseText);
-  } catch {
-    return null;
-  }
-}
-
-function parseModelJson(content) {
-  const cleaned = content
-    .trim()
-    .replace(/^```(?:json)?/i, "")
-    .replace(/```$/i, "")
-    .trim();
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-
-    if (start !== -1 && end > start) {
-      try {
-        return JSON.parse(cleaned.slice(start, end + 1));
-      } catch {
-        // 继续抛出统一的解析失败错误，便于 content script 展示。
-      }
-    }
-
-    const error = new Error("解析失败");
-    error.type = "invalid_json";
-    error.rawResponse = content;
-    throw error;
-  }
-}
-
-function normalizeAnalysis(data, fallbackWord) {
-  if (!data || typeof data !== "object" || Array.isArray(data)) {
-    const error = new Error("解析失败");
-    error.type = "invalid_json";
-    error.rawResponse = JSON.stringify(data);
-    throw error;
-  }
-
-  return {
-    word: toShortString(data.word) || fallbackWord,
-    lang: toShortString(data.lang) || "未知语言",
-    translit: toShortString(data.translit),
-    etymology: toShortString(data.etymology),
-    meaning: toShortString(data.meaning),
-    form: toShortString(data.form || data.role)
-  };
-}
-
-function buildApiError(status, payload, responseText) {
-  const apiMessage = payload?.error?.message || responseText || "API调用失败";
-  const error = new Error(apiMessage);
-  error.status = status;
-
-  if (status === 401) {
-    error.type = "invalid_key";
-    error.message = "API Key无效";
-    return error;
-  }
-
-  if (
-    status === 402 ||
-    /insufficient|balance|quota|余额|账户余额|欠费/i.test(apiMessage)
-  ) {
-    error.type = "insufficient_balance";
-    error.message = "DeepSeek账户余额不足";
-    return error;
-  }
-
-  error.type = "api_error";
-  return error;
-}
-
-async function getApiKey() {
-  const result = await getStorage([API_KEY_STORAGE_KEY]);
-  return normalizeInput(result[API_KEY_STORAGE_KEY]);
-}
-
-async function initializeEntriesStorage() {
-  const result = await getStorage([ENTRIES_STORAGE_KEY, LEGACY_CACHE_STORAGE_KEY]);
-  const now = Date.now();
-  const normalized = normalizeEntriesArray(result[ENTRIES_STORAGE_KEY], now);
-  const legacyEntries = convertLegacyCache(result[LEGACY_CACHE_STORAGE_KEY], now);
-  const mergedEntries = normalized.entries.concat(legacyEntries);
-  const cleanedEntries = removeExpiredEntries(mergedEntries);
-
-  if (
-    normalized.changed ||
-    legacyEntries.length > 0 ||
-    cleanedEntries.length !== mergedEntries.length ||
-    !Array.isArray(result[ENTRIES_STORAGE_KEY])
-  ) {
-    await setStorage({ [ENTRIES_STORAGE_KEY]: cleanedEntries });
-  }
-
-  if (result[LEGACY_CACHE_STORAGE_KEY]) {
-    await removeStorage([LEGACY_CACHE_STORAGE_KEY]);
-  }
-}
-
-async function getEntries() {
-  await storageReady;
-
-  const result = await getStorage([ENTRIES_STORAGE_KEY]);
-  const normalized = normalizeEntriesArray(result[ENTRIES_STORAGE_KEY], Date.now());
-
-  if (normalized.changed || !Array.isArray(result[ENTRIES_STORAGE_KEY])) {
-    await saveEntries(normalized.entries);
-  }
-
-  return normalized.entries;
-}
-
-async function saveEntries(entries) {
-  await setStorage({ [ENTRIES_STORAGE_KEY]: entries });
-}
-
-function createEntry(data, fallbackWord, context) {
-  const timestamp = Date.now();
-
-  return {
-    id: generateId(),
-    // 用用户选中的原文词形（而非模型返回的“原词”），保证与页面文字一致，
-    // 页内高亮才能稳定匹配到。
-    word: fallbackWord || toShortString(data.word),
-    translit: toShortString(data.translit),
-    etymology: toShortString(data.etymology),
-    meaning: toShortString(data.meaning),
-    form: toShortString(data.form || data.role),
-    lang: toShortString(data.lang) || "未知语言",
-    context,
-    timestamp,
-    starred: false,
-    exportedAt: 0
-  };
-}
-
-function normalizeEntriesArray(value, now) {
-  if (!Array.isArray(value)) {
-    return {
-      entries: [],
-      changed: value !== undefined
-    };
-  }
-
-  let changed = false;
-  const entries = [];
-
-  for (const item of value) {
-    const entry = normalizeEntry(item, now);
-    if (!entry) {
-      changed = true;
-      continue;
-    }
-
-    entries.push(entry);
-    if (!isEntryEquivalent(item, entry)) {
-      changed = true;
-    }
-  }
-
-  return {
-    entries,
-    changed
-  };
-}
-
-function isEntryEquivalent(original, normalized) {
-  return original.id === normalized.id &&
-    original.word === normalized.word &&
-    (original.translit || "") === normalized.translit &&
-    (original.etymology || "") === normalized.etymology &&
-    (original.meaning || "") === normalized.meaning &&
-    (original.form || original.role || "") === normalized.form &&
-    (original.lang || "未知语言") === normalized.lang &&
-    normalizeContext(original.context || original.sentence || "") === normalized.context &&
-    Number(original.timestamp ?? original.updatedAt) === normalized.timestamp &&
-    Boolean(original.starred) === normalized.starred &&
-    normalizeExportedAt(original.exportedAt) === normalized.exportedAt;
-}
-
-function normalizeEntry(item, now) {
-  if (!item || typeof item !== "object" || Array.isArray(item)) {
-    return null;
-  }
-
-  const word = toShortString(item.word);
-  if (!word) {
-    return null;
-  }
-
-  return {
-    id: toShortString(item.id) || generateId(),
-    word,
-    translit: toShortString(item.translit),
-    etymology: toShortString(item.etymology),
-    meaning: toShortString(item.meaning),
-    form: toShortString(item.form || item.role),
-    lang: toShortString(item.lang) || "未知语言",
-    context: normalizeContext(item.context || item.sentence || ""),
-    timestamp: normalizeTimestamp(item.timestamp ?? item.updatedAt, now),
-    starred: Boolean(item.starred),
-    exportedAt: normalizeExportedAt(item.exportedAt)
-  };
-}
-
-function normalizeExportedAt(value) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
-function convertLegacyCache(cache, now) {
-  if (!cache || typeof cache !== "object" || Array.isArray(cache)) {
-    return [];
-  }
-
-  return Object.values(cache)
-    .map((item) => normalizeEntry({
-      ...item,
-      id: item?.id || generateId(),
-      context: item?.context || "",
-      timestamp: now,
-      starred: Boolean(item?.starred)
-    }, now))
-    .filter(Boolean);
-}
-
-function removeExpiredEntries(entries) {
-  const cutoff = getSixMonthsAgoTimestamp();
-  return entries.filter((entry) => entry.starred || entry.timestamp >= cutoff);
-}
-
-function getSixMonthsAgoTimestamp() {
-  const cutoff = new Date();
-  cutoff.setMonth(cutoff.getMonth() - 6);
-  return cutoff.getTime();
-}
-
-function findEntryIndex(entries, id, word, context) {
-  const normalizedId = normalizeInput(id);
-  if (normalizedId) {
-    const idIndex = entries.findIndex((entry) => entry.id === normalizedId);
-    if (idIndex >= 0) {
-      return idIndex;
-    }
-  }
-
-  return entries.findIndex((entry) => isSameLookup(entry, word, context));
-}
-
-function findCachedEntry(entries, word, context) {
-  return entries.find((entry) => isSameLookup(entry, word, context)) || null;
-}
-
-function findEntryByWord(entries, word) {
-  const target = normalizeCacheWord(word);
-  const matches = entries.filter((entry) => normalizeCacheWord(entry.word) === target);
-  if (!matches.length) {
-    return null;
-  }
-
-  // 优先返回已收藏的；同类里取最近的一条。
-  const starred = matches.filter((entry) => entry.starred);
-  const pool = starred.length ? starred : matches;
-  return pool.reduce((best, entry) => (entry.timestamp > best.timestamp ? entry : best));
-}
-
-function isSameLookup(entry, word, context) {
-  const target = normalizeCacheWord(word);
-  const targetContext = normalizeContext(context);
-
-  return normalizeCacheWord(entry.word) === target && normalizeContext(entry.context) === targetContext;
-}
-
-function getStorage(keys) {
-  return new Promise((resolve, reject) => {
-    chrome.storage.local.get(keys, (result) => {
-      const error = chrome.runtime.lastError;
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(result);
-    });
-  });
-}
-
-function setStorage(items) {
-  return new Promise((resolve, reject) => {
-    chrome.storage.local.set(items, () => {
-      const error = chrome.runtime.lastError;
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
-function removeStorage(keys) {
-  return new Promise((resolve, reject) => {
-    chrome.storage.local.remove(keys, () => {
-      const error = chrome.runtime.lastError;
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
-function createFailure(type, message, extra = {}) {
-  return {
-    ok: false,
-    error: {
-      type,
-      message,
-      ...extra
+      return [];   // 超时或断网：就用模型的读音
     }
   };
+  // 句首大写的形式词典里多半没有：原样和小写并行查，原样优先
+  const [exact, lower = []] = await Promise.all([...new Set([bare, bare.toLocaleLowerCase()])].map(get));
+  return exact.length ? exact : lower;
 }
 
-function serializeError(error) {
-  return {
-    type: error.type || "unknown",
-    message: error.message || "未知错误",
-    status: error.status,
-    rawResponse: error.rawResponse,
-    originalMessage: error.originalMessage
-  };
+// 同形词、方言变体都在候选里：挑和模型读音最接近的那个替换进去，差太远就不换
+function pickIpa(candidates, pron) {
+  const own = pron.match(/\[[^\]]+\]|\/[^/]+\//)?.[0];
+  if (!own || !candidates.length) return "";
+  const norm = (s) => s.normalize("NFD").replace(/[\p{M}\p{Lm}\p{P}\s]/gu, "").replace(/g/g, "ɡ");
+  const target = norm(own);
+  const [[distance, best]] = candidates
+    .map((c) => [editDistance(norm(c), target), c])
+    .sort((a, b) => a[0] - b[0]);
+  return distance <= Math.max(2, target.length * 0.4) ? pron.replace(own, () => best) : "";
 }
 
-function normalizeInput(value) {
-  return typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
-}
-
-function normalizeContext(value) {
-  return normalizeInput(value);
-}
-
-function normalizeCacheWord(value) {
-  return normalizeInput(value).toLocaleLowerCase();
-}
-
-function normalizeTimestamp(value, fallback) {
-  const timestamp = Number(value);
-  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : fallback;
-}
-
-function toShortString(value) {
-  if (value === null || value === undefined) {
-    return "";
+function editDistance(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] !== b[j - 1]));
+    }
+    prev = cur;
   }
-
-  return String(value).trim().replace(/\s+/g, " ");
+  return prev[b.length];
 }
 
-function generateId() {
-  if (globalThis.crypto?.randomUUID) {
-    return globalThis.crypto.randomUUID();
+// ===== 小工具 =====
+function apiError(status, body) {
+  let message = body;
+  try { message = JSON.parse(body).error.message; } catch {}
+  if (status === 401) return err("invalid_key", "API Key 无效");
+  if (status === 402 || /insufficient|balance|quota|余额|欠费/i.test(message)) {
+    return err("insufficient_balance", "DeepSeek 账户余额不足");
   }
+  return err("api_error", `DeepSeek 返回 ${status}：${message}`.slice(0, 200));
+}
 
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+function err(type, message) {
+  return Object.assign(new Error(message), { type });
+}
+
+function errInfo(e) {
+  return { type: e.type || "unknown", message: e.message || "未知错误" };
+}
+
+function squash(s) {
+  return String(s ?? "").trim().replace(/\s+/g, " ");
 }

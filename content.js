@@ -1,966 +1,338 @@
-(function () {
+(() => {
   const CARD_ID = "mlwa-card-root";
   const CARD_WIDTH = 300;
-  const QUERY_DELAY_MS = 30;
+  const EDGE_PUNCT = /^[\s"'“”‘’«»《》（）()[\]{}<>.,，、:：;؛!?。！？؟۔]+|[\s"'“”‘’«»《》（）()[\]{}<>.,，、:：;؛!?。！？؟۔]+$/gu;
+  const SENTENCE_END = /[.!?。！？؟۔\n\r]/u;
+  // 不查：纯数字/符号（日期、电话、ISBN、价格，含波斯/阿拉伯数字），以及整个选区就是网址、邮箱、裸域名。
+  // 多是复制时顺手选中的，每次都白调一次 DeepSeek。句子里带个链接的照常查。
+  const NOT_A_WORD = /^[\p{N}\s.,:;/+\-–—%()#]+$|^\S*(https?:\/\/|www\.)\S*$|^\S+@\S+\.\S+$|^[\w-]+(\.[\w-]+)*\.(com|net|org|edu|gov|io|cn|de|ir|ru|uk|fr|jp|info|me|app|dev)(\/\S*)?$/iu;
 
-  let activeRequestId = 0;
-  let activeCard = null;
-  let outsideClickHandler = null;
-  let currentLookup = null;
-  let activePort = null;
-  // 本页查过的词，再悬停时直接出结果（背景页那边也有缓存，但省掉一次消息往返）
-  const lookupMemo = new Map();
+  let card = null;
+  let ui = null;    // 卡片里会变的节点
+  let port = null;
+  let cur = null;   // 当前卡片：{ word, sentence, rect, id, starred, data }
+  let lock = "";    // 锁定的正文语言，"" = 自动识别
 
-  document.addEventListener("mouseup", handleMouseUp, true);
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      closeCard();
-    }
-  });
-  // 进出全屏后卡片位置必然失效，直接关掉。
-  document.addEventListener("fullscreenchange", closeCard);
+  const h = (tag, props = {}, ...kids) => {
+    const el = Object.assign(document.createElement(tag), props);
+    el.append(...kids.filter((k) => k != null && k !== false));
+    return el;
+  };
 
-  function handleMouseUp(event) {
-    if (activeCard?.contains(event.target)) {
-      return;
-    }
-
-    window.setTimeout(() => {
-      const selectionInfo = readSelection();
-      if (!selectionInfo) {
-        return;
-      }
-
-      const { word, sentence, rect } = selectionInfo;
-      runLookup(word, sentence, rect);
-    }, QUERY_DELAY_MS);
-  }
-
-  // 查词主流程。
-  // 优先走流式：模型逐行输出，拿到一行就渲染一行，不用等六个字段全写完。
-  function runLookup(word, sentence, rect) {
-    if (!word) {
-      return;
-    }
-
-    const requestId = ++activeRequestId;
-    currentLookup = { word, sentence, id: null, starred: false };
-
-    // 本页查过的词直接复原，连消息都不用发
-    const memo = lookupMemo.get(word);
-    if (memo) {
-      currentLookup.id = memo.id || null;
-      currentLookup.starred = Boolean(memo.starred);
-      renderResult(memo, { cached: true, rect });
-      return;
-    }
-
-    showLoadingCard(word, rect);
-
-    if (!startStreamingLookup(word, sentence, rect, requestId)) {
-      fallbackLookup(word, sentence, rect, requestId);
-    }
-  }
-
-  function startStreamingLookup(word, sentence, rect, requestId) {
-    let port = null;
-    try {
-      port = chrome.runtime.connect({ name: "nama-lookup" });
-    } catch (error) {
-      return false;
-    }
-    if (!port) {
-      return false;
-    }
-
-    closeActivePort();
-    activePort = port;
-    let answered = false;
-
-    port.onMessage.addListener((message) => {
-      if (requestId !== activeRequestId || !message) {
-        return;
-      }
-
-      if (message.type === "partial") {
-        answered = true;
-        renderResult(message.data, { rect, partial: true });
-        return;
-      }
-
-      if (message.type === "done") {
-        answered = true;
-        currentLookup = {
-          word,
-          sentence,
-          id: message.id || null,
-          starred: Boolean(message.data && message.data.starred)
-        };
-        if (message.data) {
-          lookupMemo.set(word, message.data);
-        }
-        renderResult(message.data, { cached: Boolean(message.cached), rect });
-        closeActivePort();
-        return;
-      }
-
-      if (message.type === "error") {
-        answered = true;
-        showError(message.error || { type: "unknown", message: "查询失败" }, word, rect);
-        closeActivePort();
-      }
-    });
-
-    port.onDisconnect.addListener(() => {
-      if (activePort === port) {
-        activePort = null;
-      }
-      // 后台没接住（比如 service worker 刚被回收）→ 退回一次性请求
-      if (!answered && requestId === activeRequestId) {
-        fallbackLookup(word, sentence, rect, requestId);
-      }
-    });
-
-    try {
-      port.postMessage({ type: "LOOKUP_STREAM", word, sentence });
-    } catch (error) {
-      closeActivePort();
-      return false;
-    }
-    return true;
-  }
-
-  function closeActivePort() {
-    if (activePort) {
-      try {
-        activePort.disconnect();
-      } catch (error) {
-        // 已经断了
-      }
-      activePort = null;
-    }
-  }
-
-  function fallbackLookup(word, sentence, rect, requestId) {
-    sendRuntimeMessage({
-      type: "LOOKUP_WORD",
-      word,
-      sentence,
-      useCache: true
-    })
-      .then((response) => {
-        if (requestId !== activeRequestId) {
-          return;
-        }
-
-        if (!response?.ok) {
-          showError(response?.error || { type: "unknown", message: "查询失败" }, word, rect);
-          return;
-        }
-
-        currentLookup = {
-          word,
-          sentence,
-          id: response.id || response.data?.id || null,
-          starred: Boolean(response.data?.starred)
-        };
-        if (response.data) {
-          lookupMemo.set(word, response.data);
-        }
-        renderResult(response.data, {
-          cached: Boolean(response.cached),
-          rect
-        });
-      })
-      .catch((error) => {
-        if (requestId !== activeRequestId) {
-          return;
-        }
-
-        showError(
-          {
-            type: "runtime_error",
-            message: error.message || "扩展通信失败"
-          },
-          word,
-          rect
-        );
-      });
-  }
+  document.addEventListener("mouseup", (event) => {
+    if (card?.contains(event.target)) return;
+    setTimeout(() => {
+      const sel = readSelection();
+      if (sel) lookup(sel);
+    }, 30);
+  }, true);
+  document.addEventListener("mousedown", (event) => {
+    if (card && !card.contains(event.target)) closeCard();
+  }, true);
+  document.addEventListener("keydown", (event) => event.key === "Escape" && closeCard());
+  document.addEventListener("fullscreenchange", closeCard);   // 进出全屏后位置必然失效
 
   function readSelection() {
-    const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-      return null;
-    }
-
-    const range = selection.getRangeAt(0);
-    const rawText = selection.toString();
-    const word = cleanSelectedText(rawText);
-
+    const sel = getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+    const word = sel.toString().replace(/\u00A0/g, " ").replace(/\s+/g, " ").replace(EDGE_PUNCT, "");
     if (!word) {
       closeCard();
       return null;
     }
-
-    const rect = getRangeRect(range);
-    if (!rect) {
-      return null;
-    }
-
-    return {
-      word,
-      sentence: extractSentence(selection, range, rawText, word),
-      rect
-    };
+    if (NOT_A_WORD.test(word)) return null;
+    const range = sel.getRangeAt(0);
+    const box = range.getBoundingClientRect();
+    const rect = box.width || box.height ? box : range.getClientRects()[0];
+    return rect && { word, rect, sentence: sentenceAround(range, word) || word };
   }
 
-  function cleanSelectedText(text) {
-    return text
-      .replace(/\u00a0/g, " ")
-      .trim()
-      .replace(/\s+/g, " ")
-      .replace(/^[\s"'“”‘’«»《》（）()[\]{}<>.,，、:：;؛.!?。！？؟۔]+/u, "")
-      .replace(/[\s"'“”‘’«»《》（）()[\]{}<>.,，、:：;؛.!?。！？؟۔]+$/u, "");
+  // 选区所在块元素里，从上一个句末标点到下一个句末标点；跨内联标签（链接、强调）也连得上。
+  // 用 innerText（渲染后的文字）而不是 textContent：HTML 源码里的折行在 textContent 里是 \n，
+  // 会把长句切成几个词；<br> 在 textContent 里又什么都没有，前后两行的词会粘在一起。
+  function sentenceAround(range, word) {
+    // 按共同祖先找块：选区起点常落在上一个元素的文字末尾，按起点找会找到别的块
+    const node = range.commonAncestorContainer;
+    const block = (node.nodeType === 1 ? node : node.parentElement)
+      ?.closest("p,li,blockquote,td,th,dd,dt,figcaption,h1,h2,h3,h4,h5,h6,div") || document.body;
+    const text = block.innerText;
+    // 在 innerText 里找选中的文字；块里出现多次时取位置最接近选区的那次（按 textContent 偏移等比估算）
+    const before = document.createRange();
+    before.setStart(block, 0);
+    before.setEnd(range.startContainer, range.startOffset);
+    const guess = (before.toString().length / Math.max(1, block.textContent.length)) * text.length;
+    const re = new RegExp(word.split(" ").map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+"), "giu");
+    let hit = null;
+    for (const m of text.matchAll(re)) if (!hit || Math.abs(m.index - guess) < Math.abs(hit.index - guess)) hit = m;
+    if (!hit) return "";
+    const i = hit.index;
+    const j = i + hit[0].length;
+    let a = i;
+    let b = j;
+    while (a > 0 && !SENTENCE_END.test(text[a - 1])) a--;
+    while (b < text.length && !SENTENCE_END.test(text[b])) b++;
+    // 超长无标点的段落只取选区前后各 250 字
+    return text.slice(Math.max(a, i - 250), Math.min(b + 1, j + 250)).replace(/\s+/g, " ").trim();
   }
 
-  function getRangeRect(range) {
-    const directRect = range.getBoundingClientRect();
-    if (directRect && (directRect.width || directRect.height)) {
-      return directRect;
+  // 后台消息：{data} 流式片段 → {done, data} 最终词条 → 可能再来 {patch} 词典读音 → 后台断开
+  function lookup(sel, fresh = false) {
+    port?.disconnect();
+    cur = { word: sel.word, sentence: sel.sentence, rect: sel.rect, id: fresh ? sel.id : null, starred: fresh && sel.starred, data: {} };
+    build();
+    render(true);
+    let settled = false;
+    let p;
+    try {
+      p = port = chrome.runtime.connect({ name: "nama-lookup" });
+    } catch {
+      port = null;
+      return showError({ message: "扩展刚更新过，请刷新本页" });
     }
-
-    const rects = range.getClientRects();
-    return rects.length ? rects[0] : null;
-  }
-
-  function extractSentence(selection, range, rawSelectedText, cleanWord) {
-    const textNodeContext = getTextNodeContext(range.startContainer, range.startOffset);
-    if (textNodeContext) {
-      return findSentenceAroundIndex(
-        textNodeContext.text,
-        textNodeContext.offset,
-        rawSelectedText,
-        cleanWord
-      );
-    }
-
-    const anchorText = getNodeText(selection.anchorNode);
-    const anchorSentence = findSentenceByText(anchorText, rawSelectedText, cleanWord);
-    if (anchorSentence) {
-      return anchorSentence;
-    }
-
-    const commonText = getNodeText(range.commonAncestorContainer);
-    const commonSentence = findSentenceByText(commonText, rawSelectedText, cleanWord);
-    if (commonSentence) {
-      return commonSentence;
-    }
-
-    return cleanSelectedText(rawSelectedText) || cleanWord;
-  }
-
-  function getTextNodeContext(node, offset) {
-    if (!node || node.nodeType !== Node.TEXT_NODE || typeof node.textContent !== "string") {
-      return null;
-    }
-
-    return {
-      text: node.textContent,
-      offset: Math.max(0, Math.min(offset, node.textContent.length))
-    };
-  }
-
-  function getNodeText(node) {
-    if (!node) {
-      return "";
-    }
-
-    if (node.nodeType === Node.TEXT_NODE) {
-      return node.textContent || "";
-    }
-
-    if (node.nodeType === Node.ELEMENT_NODE) {
-      const element = node.closest?.("p, li, blockquote, td, th, figcaption, article, section, div");
-      return element?.innerText || node.textContent || "";
-    }
-
-    return node.textContent || "";
-  }
-
-  function findSentenceByText(text, rawSelectedText, cleanWord) {
-    if (!text) {
-      return "";
-    }
-
-    const rawIndex = rawSelectedText ? text.indexOf(rawSelectedText) : -1;
-    if (rawIndex >= 0) {
-      return findSentenceAroundIndex(text, rawIndex, rawSelectedText, cleanWord);
-    }
-
-    const cleanIndex = cleanWord ? text.indexOf(cleanWord) : -1;
-    if (cleanIndex >= 0) {
-      return findSentenceAroundIndex(text, cleanIndex, rawSelectedText, cleanWord);
-    }
-
-    return "";
-  }
-
-  function findSentenceAroundIndex(text, index, rawSelectedText, cleanWord) {
-    if (!text) {
-      return cleanWord;
-    }
-
-    let targetIndex = index;
-    if (targetIndex < 0) {
-      targetIndex = rawSelectedText ? text.indexOf(rawSelectedText) : -1;
-    }
-    if (targetIndex < 0) {
-      targetIndex = cleanWord ? text.indexOf(cleanWord) : -1;
-    }
-    if (targetIndex < 0) {
-      return trimSentence(text);
-    }
-
-    const start = findPreviousSentenceBoundary(text, targetIndex);
-    const end = findNextSentenceBoundary(text, targetIndex);
-    return trimSentence(text.slice(start, end));
-  }
-
-  function findPreviousSentenceBoundary(text, index) {
-    for (let i = index - 1; i >= 0; i -= 1) {
-      if (isSentenceBoundary(text[i])) {
-        return i + 1;
+    p.onMessage.addListener((msg) => {
+      if (p !== port) return;
+      if (msg.error) {
+        port = null;
+        p.disconnect();
+        return showError(msg.error);
       }
-    }
-    return 0;
-  }
-
-  function findNextSentenceBoundary(text, index) {
-    for (let i = index; i < text.length; i += 1) {
-      if (isSentenceBoundary(text[i])) {
-        return i + 1;
+      if (msg.lock !== undefined) lock = msg.lock;
+      if (msg.done) {
+        settled = true;
+        cur.id = msg.data.id;
+        cur.starred = msg.data.starred;
       }
-    }
-    return text.length;
-  }
-
-  function isSentenceBoundary(char) {
-    return /[.!?。！？؟۔\n\r]/u.test(char);
-  }
-
-  function trimSentence(text) {
-    const normalized = text.replace(/\s+/g, " ").trim();
-    if (normalized.length <= 500) {
-      return normalized;
-    }
-
-    return `${normalized.slice(0, 500)}...`;
-  }
-
-  function showLoadingCard(word, rect) {
-    const card = ensureCard(rect);
-    card.replaceChildren(
-      createHeader(word, "", true),
-      createStatus("分析中...")
-    );
-    positionCard(card, rect);
-  }
-
-  function renderResult(data, options = {}) {
-    const card = ensureCard(options.rect);
-    const partial = Boolean(options.partial);
-    // 流式过程中还没写到的字段留省略号，别显示成"暂无"（那是"查不到"的意思）
-    const blank = partial ? "…" : "暂无";
-
-    if (data?.id && currentLookup) {
-      currentLookup.id = data.id;
-      currentLookup.starred = Boolean(data.starred);
-    }
-
-    card.replaceChildren(
-      createHeader(data.word || currentLookup?.word || "", data.translit || "", true, {
-        id: data.id,
-        starred: Boolean(data.starred)
-      }),
-      createLangTag(data.lang || (partial ? "…" : "未知语言")),
-      createField("💡", "词义", data.meaning || blank),
-      createField("🌱", "词源", data.etymology || blank),
-      createField("📍", "句中作用", data.form || blank),
-      createFooter(partial)
-    );
-
-    if (options.rect) {
-      positionCard(card, options.rect);
-    }
-  }
-
-  function showError(error, word, rect) {
-    const card = ensureCard(rect);
-    const friendlyMessage = getFriendlyErrorMessage(error);
-
-    if (error?.type === "invalid_json" && error.rawResponse) {
-      console.warn("[多语言查词助手] DeepSeek返回非法JSON：", error.rawResponse);
-    }
-
-    card.replaceChildren(
-      createHeader(word || "查询失败", "", true),
-      createStatus(friendlyMessage, true),
-      error?.type === "missing_key" ? createOpenOptionsButton() : createRetryHint()
-    );
-
-    if (rect) {
-      positionCard(card, rect);
-    }
-  }
-
-  // 全屏时只有全屏元素的子树会被渲染，卡片必须挂到全屏元素里。
-  function cardHost() {
-    return document.fullscreenElement || document.documentElement;
-  }
-
-  function ensureCard(rect) {
-    const host = cardHost();
-
-    if (!activeCard) {
-      activeCard = document.createElement("div");
-      activeCard.id = CARD_ID;
-      activeCard.className = "mlwa-card";
-      activeCard.addEventListener("mousedown", (event) => event.stopPropagation());
-      host.appendChild(activeCard);
-      bindOutsideClick();
-    } else if (activeCard.parentNode !== host) {
-      host.appendChild(activeCard);
-    }
-
-    if (rect) {
-      positionCard(activeCard, rect);
-    }
-
-    return activeCard;
-  }
-
-  function positionCard(card, rect) {
-    const margin = 12;
-    // 挂在全屏元素里时页面滚动无意义，改用 fixed + 视口坐标。
-    const isFixed = card.parentNode !== document.documentElement;
-    card.style.position = isFixed ? "fixed" : "absolute";
-    const scrollX = isFixed ? 0 : (window.scrollX || window.pageXOffset || 0);
-    const scrollY = isFixed ? 0 : (window.scrollY || window.pageYOffset || 0);
-    const maxLeft = scrollX + window.innerWidth - CARD_WIDTH - margin;
-    const left = Math.max(scrollX + margin, Math.min(scrollX + rect.left, maxLeft));
-    const belowTop = scrollY + rect.bottom + 8;
-    const aboveTop = scrollY + rect.top - card.offsetHeight - 8;
-    const estimatedHeight = card.offsetHeight || 190;
-    const wouldOverflowBottom = belowTop + estimatedHeight > scrollY + window.innerHeight - margin;
-    const top = wouldOverflowBottom && aboveTop > scrollY + margin
-      ? aboveTop
-      : belowTop;
-
-    card.style.left = `${Math.round(left)}px`;
-    card.style.top = `${Math.round(Math.max(scrollY + margin, top))}px`;
-  }
-
-  function createHeader(word, translit, withClose, starState = null) {
-    const header = document.createElement("div");
-    header.className = "mlwa-header";
-
-    const title = document.createElement("div");
-    title.className = "mlwa-title";
-
-    const wordNode = document.createElement("span");
-    wordNode.className = "mlwa-word";
-    wordNode.textContent = word;
-    title.appendChild(wordNode);
-
-    if (translit) {
-      const translitNode = document.createElement("span");
-      translitNode.className = "mlwa-translit";
-      translitNode.textContent = translit;
-      title.appendChild(translitNode);
-    }
-
-    header.appendChild(title);
-
-    const actions = document.createElement("div");
-    actions.className = "mlwa-header-actions";
-
-    if (starState?.id) {
-      actions.appendChild(createStarButton(starState.starred));
-    }
-
-    if (withClose) {
-      const closeButton = document.createElement("button");
-      closeButton.type = "button";
-      closeButton.className = "mlwa-close";
-      closeButton.textContent = "×";
-      closeButton.title = "关闭";
-      closeButton.addEventListener("click", closeCard);
-      actions.appendChild(closeButton);
-    }
-
-    header.appendChild(actions);
-    return header;
-  }
-
-  function createStarButton(starred) {
-    const starButton = document.createElement("button");
-    starButton.type = "button";
-    starButton.className = starred ? "mlwa-star is-starred" : "mlwa-star";
-    starButton.textContent = starred ? "⭐" : "☆";
-    starButton.title = starred ? "从生词本移除" : "加入生词本";
-    starButton.setAttribute("aria-label", starButton.title);
-    starButton.addEventListener("click", handleStarClick);
-    return starButton;
-  }
-
-  function createLangTag(lang) {
-    const row = document.createElement("div");
-    row.className = "mlwa-tag-row";
-
-    const tag = document.createElement("span");
-    tag.className = "mlwa-lang-tag";
-    tag.textContent = lang;
-    row.appendChild(tag);
-
-    return row;
-  }
-
-  function createField(icon, label, value) {
-    const row = document.createElement("div");
-    row.className = "mlwa-field";
-
-    const iconNode = document.createElement("span");
-    iconNode.className = "mlwa-field-icon";
-    iconNode.textContent = icon;
-    row.appendChild(iconNode);
-
-    const content = document.createElement("div");
-    content.className = "mlwa-field-content";
-
-    const labelNode = document.createElement("span");
-    labelNode.className = "mlwa-field-label";
-    labelNode.textContent = label;
-    content.appendChild(labelNode);
-
-    const valueNode = document.createElement("span");
-    valueNode.className = "mlwa-field-value";
-    valueNode.textContent = value;
-    content.appendChild(valueNode);
-
-    row.appendChild(content);
-    return row;
-  }
-
-  function createStatus(message, isError = false) {
-    const status = document.createElement("div");
-    status.className = isError ? "mlwa-status mlwa-status-error" : "mlwa-status";
-    status.textContent = message;
-    return status;
-  }
-
-  function createFooter(partial = false) {
-    const footer = document.createElement("div");
-    footer.className = "mlwa-footer";
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "mlwa-secondary-button";
-    button.textContent = partial ? "生成中…" : "重新分析";
-    button.disabled = partial;
-    if (!partial) {
-      button.addEventListener("click", handleReanalyzeClick);
-    }
-    footer.appendChild(button);
-
-    return footer;
-  }
-
-  function createOpenOptionsButton() {
-    const footer = document.createElement("div");
-    footer.className = "mlwa-footer";
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "mlwa-primary-button";
-    button.textContent = "打开设置页";
-    button.addEventListener("click", () => {
-      sendRuntimeMessage({ type: "OPEN_OPTIONS" });
+      Object.assign(cur.data, msg.data || msg.patch);
+      render(!settled);
     });
-    footer.appendChild(button);
-
-    return footer;
+    p.onDisconnect.addListener(() => {
+      if (p !== port) return;
+      port = null;
+      if (!settled) showError({ message: "扩展后台断开了，请重试" });
+    });
+    p.postMessage({ word: cur.word, sentence: cur.sentence, fresh, id: cur.id });
   }
 
-  function createRetryHint() {
-    const hint = document.createElement("div");
-    hint.className = "mlwa-hint";
-    hint.textContent = "可以稍后重新选中单词再试。";
-    return hint;
-  }
-
-  function handleReanalyzeClick(event) {
-    const button = event.currentTarget;
-    if (!currentLookup?.word) {
-      return;
-    }
-
-    button.disabled = true;
-    button.textContent = "分析中...";
-
-    sendRuntimeMessage({
-      type: "REANALYZE_FORM",
-      word: currentLookup.word,
-      sentence: currentLookup.sentence,
-      id: currentLookup.id
-    })
-      .then((response) => {
-        if (!response?.ok) {
-          showError(response?.error || { type: "unknown", message: "查询失败" }, currentLookup.word);
-          return;
-        }
-
-        currentLookup.id = response.id || response.data?.id || currentLookup.id;
-        currentLookup.starred = Boolean(response.data?.starred);
-        renderResult(response.data, {
-          cached: true
-        });
-      })
-      .catch((error) => {
-        showError(
-          {
-            type: "runtime_error",
-            message: error.message || "扩展通信失败"
-          },
-          currentLookup.word
-        );
-      });
-  }
-
-  function handleStarClick(event) {
-    event.stopPropagation();
-
-    const button = event.currentTarget;
-    if (!currentLookup?.id) {
-      return;
-    }
-
-    button.disabled = true;
-
-    sendRuntimeMessage({
-      type: "TOGGLE_STAR",
-      id: currentLookup.id
-    })
-      .then((response) => {
-        if (!response?.ok) {
-          button.disabled = false;
-          showError(response?.error || { type: "unknown", message: "星标更新失败" }, currentLookup.word);
-          return;
-        }
-
-        currentLookup.starred = Boolean(response.data?.starred);
-        if (response.data && currentLookup.word) {
-          lookupMemo.set(currentLookup.word, response.data);
-        }
-        updateStarButton(button, currentLookup.starred);
-
-        // 收藏/取消后就地更新页内高亮，无需刷新页面
-        if (currentLookup.starred) {
-          addHighlightWord(currentLookup.word);
-        } else {
-          removeHighlightWord(currentLookup.word);
-        }
-      })
-      .catch((error) => {
-        button.disabled = false;
-        showError(
-          {
-            type: "runtime_error",
-            message: error.message || "星标更新失败"
-          },
-          currentLookup.word
-        );
-      });
-  }
-
-  function updateStarButton(button, starred) {
-    button.disabled = false;
-    button.classList.toggle("is-starred", starred);
-    button.textContent = starred ? "⭐" : "☆";
-    button.title = starred ? "从生词本移除" : "加入生词本";
-    button.setAttribute("aria-label", button.title);
-  }
-
-  function bindOutsideClick() {
-    removeOutsideClick();
-    outsideClickHandler = (event) => {
-      if (activeCard && !activeCard.contains(event.target)) {
-        closeCard();
-      }
+  // 每次查词搭一次骨架，流式结果只改文字：下拉框要是跟着重建，一打开就会被收起
+  function build() {
+    const value = () => h("span", { className: "mlwa-field-value" });
+    const field = (icon, label, node) => h("div", { className: "mlwa-field" },
+      h("span", { className: "mlwa-field-icon", textContent: icon }),
+      h("div", { className: "mlwa-field-content" }, h("span", { className: "mlwa-field-label", textContent: label }), node));
+    ui = {
+      translit: h("span"),
+      star: h("button", { type: "button", onclick: toggleStar }),
+      lang: h("span", { className: "mlwa-lang-tag" }),
+      select: langSelect(),
+      meaning: value(),
+      etymology: value(),
+      form: value(),
+      redo: h("button", { type: "button", className: "mlwa-secondary-button", onclick: () => lookup(cur, true) })
     };
-    document.addEventListener("mousedown", outsideClickHandler, true);
+    show(
+      header(ui.translit, ui.star),
+      h("div", { className: "mlwa-tag-row" }, ui.lang, ui.select),
+      field("💡", "词义", ui.meaning),
+      field("🌱", "词源", ui.etymology),
+      field("📍", "句中作用", ui.form),
+      h("div", { className: "mlwa-footer" }, ui.redo)
+    );
   }
 
-  function removeOutsideClick() {
-    if (outsideClickHandler) {
-      document.removeEventListener("mousedown", outsideClickHandler, true);
-      outsideClickHandler = null;
+  function render(busy) {
+    const d = cur.data;
+    const blank = busy ? "…" : "暂无";
+    Object.assign(ui.translit, {
+      hidden: !d.translit,
+      textContent: d.translit || "",
+      className: d.ipaDict ? "mlwa-translit mlwa-dict" : "mlwa-translit",
+      title: d.ipaDict ? "IPA 取自 Wiktionary（kaikki.org）" : "模型给出的读音"
+    });
+    ui.lang.textContent = d.lang || (busy ? "…" : "未知语言");
+    if (ui.select.value !== lock) ui.select.value = lock;
+    for (const key of ["meaning", "etymology", "form"]) ui[key].textContent = d[key] || blank;
+    Object.assign(ui.redo, { textContent: busy ? "生成中…" : "重新分析", disabled: busy });
+    paintStar();
+    place();
+  }
+
+  function paintStar() {
+    Object.assign(ui.star, {
+      hidden: !cur.id,
+      disabled: false,
+      className: cur.starred ? "mlwa-star is-starred" : "mlwa-star",
+      textContent: cur.starred ? "⭐" : "☆",
+      title: cur.starred ? "从生词本移除" : "加入生词本"
+    });
+  }
+
+  function showError(error) {
+    ui = null;
+    show(
+      header(),
+      h("div", { className: "mlwa-status mlwa-status-error", textContent: error.message || "查询失败" }),
+      error.type === "missing_key"
+        ? h("div", { className: "mlwa-footer" }, h("button", {
+          type: "button",
+          className: "mlwa-primary-button",
+          textContent: "打开设置页",
+          onclick: () => chrome.runtime.sendMessage({ type: "OPEN_OPTIONS" })
+        }))
+        : h("div", { className: "mlwa-hint", textContent: "可以稍后重新选中再试。" })
+    );
+  }
+
+  function header(translit, star) {
+    return h("div", { className: "mlwa-header" },
+      h("div", { className: "mlwa-title" }, h("span", { className: "mlwa-word", textContent: cur.word }), translit),
+      h("div", { className: "mlwa-header-actions" }, star,
+        h("button", { type: "button", className: "mlwa-close", textContent: "×", title: "关闭", onclick: closeCard })));
+  }
+
+  // 正文语言：锁定后模型只按这门语言分析，不会在近亲语言之间跳；所有页面共用
+  function langSelect() {
+    const select = h("select", { className: "mlwa-lang-select", title: "正文语言" },
+      h("option", { value: "", textContent: "自动识别" }),
+      ...Object.keys(LANGS).map((name) => h("option", { value: name, textContent: name })));
+    select.value = lock;
+    select.onchange = async () => {
+      lock = select.value;
+      await chrome.storage.local.set({ readLang: lock });
+      lookup(cur);
+    };
+    return select;
+  }
+
+  async function toggleStar() {
+    const c = cur;   // 等待期间卡片可能已换词或关闭
+    const starred = !c.starred;
+    ui.star.disabled = true;
+    const res = await chrome.runtime.sendMessage({ type: "PATCH", items: [{ id: c.id, word: c.data.word }], patch: { starred } })
+      .catch((e) => ({ error: { message: e.message } }));
+    if (!res?.ok) return c === cur && showError(res?.error || {});
+    c.starred = starred;
+    if (c === cur && ui) paintStar();
+    setHighlight(c.word, starred);
+  }
+
+  // 全屏时只有全屏元素的子树会渲染，卡片得挂进去
+  function show(...children) {
+    const host = document.fullscreenElement || document.documentElement;
+    if (!card) {
+      card = h("div", { id: CARD_ID, className: "mlwa-card" });
+      card.addEventListener("mousedown", (event) => event.stopPropagation());
     }
+    if (card.parentNode !== host) host.appendChild(card);
+    card.replaceChildren(...children);
+    place();
+  }
+
+  function place() {
+    const fixed = card.parentNode !== document.documentElement;
+    const sx = fixed ? 0 : scrollX;
+    const sy = fixed ? 0 : scrollY;
+    const r = cur.rect;
+    const m = 12;
+    const left = Math.max(sx + m, Math.min(sx + r.left, sx + innerWidth - CARD_WIDTH - m));
+    const below = sy + r.bottom + 8;
+    const above = sy + r.top - card.offsetHeight - 8;
+    const top = below + card.offsetHeight > sy + innerHeight - m && above > sy + m ? above : below;
+    Object.assign(card.style, {
+      position: fixed ? "fixed" : "absolute",
+      left: `${Math.round(left)}px`,
+      top: `${Math.round(Math.max(sy + m, top))}px`
+    });
   }
 
   function closeCard() {
-    activeRequestId += 1;
-    closeActivePort();   // 卡片关了就别再让模型往下生成
-    currentLookup = null;
-    if (activeCard) {
-      activeCard.remove();
-      activeCard = null;
-    }
-    removeOutsideClick();
+    port?.disconnect();   // 后台照样生成完并存下来，只是不再推给卡片
+    port = null;
+    cur = null;
+    ui = null;
+    card?.remove();
+    card = null;
   }
 
-  function getFriendlyErrorMessage(error) {
-    switch (error?.type) {
-      case "missing_key":
-        return "请先在扩展设置中配置DeepSeek API Key";
-      case "invalid_key":
-        return "API Key无效";
-      case "insufficient_balance":
-        return "DeepSeek账户余额不足";
-      case "network":
-        return "网络错误，请重试";
-      case "timeout":
-        return "请求超时，请重试";
-      case "invalid_json":
-        return "解析失败";
-      default:
-        return error?.message || "查询失败";
-    }
+  // ===== 生词页内高亮：纯静态点线下划线，不响应鼠标 =====
+  const HL = "mlwa-hl";
+  const SKIP = `script,style,noscript,textarea,input,select,option,code,pre,kbd,samp,.${HL},#${CARD_ID}`;
+  const hlWords = new Set();
+  let hlOn = false;
+  let hlRe = null;
+
+  chrome.storage.local.get(["starredWords", "highlightEnabled", "readLang"]).then(({ starredWords = [], highlightEnabled = true, readLang = "" }) => {
+    lock = langKey(readLang);
+    hlOn = highlightEnabled;
+    if (!hlOn) return;
+    starredWords.forEach(addWord);
+    buildRegex();
+    observe();
+    scan();
+    // 兜底：load 之后和稍后几秒再整页扫一遍，覆盖观察器漏掉的内容（已高亮的会跳过）
+    addEventListener("load", scan, { once: true });
+    setTimeout(scan, 1500);
+    setTimeout(scan, 4000);
+  }).catch(() => {});
+
+  function addWord(word) {
+    const w = String(word || "").trim().toLowerCase();
+    if (w.length >= 2) hlWords.add(w);
   }
 
-  function sendRuntimeMessage(payload) {
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(payload, (response) => {
-        const error = chrome.runtime.lastError;
-        if (error) {
-          reject(new Error(error.message));
-          return;
-        }
-        resolve(response);
-      });
-    });
+  function buildRegex() {
+    const alt = [...hlWords]
+      .sort((a, b) => b.length - a.length)   // 长词优先
+      .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("|");
+    hlRe = alt ? new RegExp(`(?<![\\p{L}\\p{M}])(?:${alt})(?![\\p{L}\\p{M}])`, "giu") : null;
   }
 
-  // ===== 生词页内高亮 =====
-  const HL_CLASS = "mlwa-hl";
-  const HL_SKIP_TAGS = new Set([
-    "SCRIPT", "STYLE", "NOSCRIPT", "TEXTAREA", "INPUT", "SELECT",
-    "CODE", "PRE", "KBD", "SAMP", "OPTION"
-  ]);
-
-  let hlRegex = null;
-  let hlObserver = null;
-  let hlSettingOn = false;
-  const hlForms = new Set(); // 已跟踪的生词（小写）
-
-  async function initHighlight() {
-    hlSettingOn = await getHighlightEnabled();
-    if (!hlSettingOn) {
+  function setHighlight(word, on) {
+    if (!hlOn) return;
+    const w = word.trim().toLowerCase();
+    if (on) {
+      addWord(w);
+      buildRegex();
+      scan();
       return;
     }
-    const resp = await sendRuntimeMessage({ type: "GET_ENTRIES" }).catch(() => null);
-    const entries = resp?.ok && Array.isArray(resp.entries)
-      ? resp.entries.filter((e) => e && e.starred && e.word)
-      : [];
-    for (const entry of entries) {
-      const form = String(entry.word || "").trim();
-      if (form.length >= 2) {
-        hlForms.add(form.toLowerCase());
-      }
-    }
-    rebuildRegex();
-    // 无论当前有没有词都启动观察器，方便之后新增的词也能覆盖到后续加载的内容
-    observeMutations();
-    if (hlRegex && document.body) {
-      highlightRoot(document.body);
-    }
-    scheduleRescans();
-  }
-
-  // 兜底：页面 load 完成及稍后再整页重扫几次，覆盖初次扫描后才插入的内容
-  // （观察器偶有遗漏的情况）。highlightRoot 幂等，已高亮的会跳过。
-  function scheduleRescans() {
-    const rescan = () => {
-      if (hlSettingOn && hlRegex && document.body) {
-        highlightRoot(document.body);
-      }
-    };
-    if (document.readyState !== "complete") {
-      window.addEventListener("load", rescan, { once: true });
-    }
-    setTimeout(rescan, 1500);
-    setTimeout(rescan, 4000);
-  }
-
-  function getHighlightEnabled() {
-    return new Promise((resolve) => {
-      chrome.storage.local.get(["highlightEnabled"], (r) => {
-        const v = r && r.highlightEnabled;
-        resolve(v === undefined ? true : Boolean(v));
-      });
-    });
-  }
-
-  function rebuildRegex() {
-    const forms = Array.from(hlForms).filter((f) => f.length >= 2);
-    if (!forms.length) {
-      hlRegex = null;
-      return;
-    }
-    forms.sort((a, b) => b.length - a.length); // 长词优先
-    const alt = forms.map(escapeRegex).join("|");
-    try {
-      hlRegex = new RegExp("(?<![\\p{L}\\p{M}])(" + alt + ")(?![\\p{L}\\p{M}])", "giu");
-    } catch (e) {
-      try {
-        hlRegex = new RegExp("(" + alt + ")", "giu");
-      } catch (e2) {
-        hlRegex = null;
-      }
+    hlWords.delete(w);
+    buildRegex();
+    for (const span of document.querySelectorAll(`.${HL}`)) {
+      if (span.textContent.toLowerCase() === w) span.replaceWith(span.textContent);
     }
   }
 
-  // 收藏后：把该词的下划线就地加上，不刷新页面。
-  function addHighlightWord(word) {
-    if (!hlSettingOn) {
-      return;
-    }
-    const form = String(word || "").trim();
-    if (form.length < 2) {
-      return;
-    }
-    const key = form.toLowerCase();
-    if (!hlForms.has(key)) {
-      hlForms.add(key);
-      rebuildRegex();
-    }
-    if (!hlRegex || !document.body) {
-      return;
-    }
-    observeMutations();
-    highlightRoot(document.body); // 幂等：新词会被包裹，已高亮的会跳过
+  function scan(root = document.body) {
+    if (!hlRe || !root) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    nodes.forEach(highlightText);
   }
 
-  // 取消收藏后：就地去掉该词的下划线。
-  function removeHighlightWord(word) {
-    const key = String(word || "").trim().toLowerCase();
-    if (!hlForms.has(key)) {
-      return;
-    }
-    hlForms.delete(key);
-    rebuildRegex();
-    const spans = document.querySelectorAll("." + HL_CLASS);
-    for (const span of spans) {
-      if ((span.textContent || "").toLowerCase() === key) {
-        span.replaceWith(document.createTextNode(span.textContent));
-      }
-    }
-  }
-
-  function escapeRegex(s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  function isSkippableParent(node) {
-    const parent = node.parentNode;
-    if (!parent || parent.nodeType !== 1) {
-      return true;
-    }
-    if (HL_SKIP_TAGS.has(parent.tagName) || parent.isContentEditable) {
-      return true;
-    }
-    if (parent.closest && parent.closest("." + HL_CLASS + ", #" + CARD_ID + ", #mlwa-hl-tip")) {
-      return true;
-    }
-    return false;
-  }
-
-  function highlightRoot(root) {
-    if (!root || !hlRegex) {
-      return;
-    }
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        if (!node.nodeValue || !node.nodeValue.trim()) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        return isSkippableParent(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
-      }
-    });
-    const targets = [];
-    let n;
-    while ((n = walker.nextNode())) {
-      targets.push(n);
-    }
-    for (const node of targets) {
-      highlightTextNode(node);
-    }
-  }
-
-  function highlightTextNode(node) {
-    if (!hlRegex || !node.nodeValue || isSkippableParent(node)) {
-      return;
-    }
+  function highlightText(node) {
+    const parent = node.parentElement;
     const text = node.nodeValue;
-    hlRegex.lastIndex = 0;
-    if (!hlRegex.test(text)) {
-      return;
-    }
-
-    hlRegex.lastIndex = 0;
-    const frag = document.createDocumentFragment();
+    if (!hlRe || !parent || !text?.trim() || parent.isContentEditable || parent.closest(SKIP)) return;
+    const parts = [];
     let last = 0;
-    let m;
-    while ((m = hlRegex.exec(text)) !== null) {
-      const matched = m[0];
-      if (!matched) {
-        hlRegex.lastIndex += 1;
-        continue;
-      }
-      const start = m.index;
-      if (start > last) {
-        frag.appendChild(document.createTextNode(text.slice(last, start)));
-      }
-      const span = document.createElement("span");
-      span.className = HL_CLASS;
-      span.textContent = matched;
-      frag.appendChild(span);
-      last = start + matched.length;
+    for (const m of text.matchAll(hlRe)) {
+      parts.push(text.slice(last, m.index), h("span", { className: HL, textContent: m[0] }));
+      last = m.index + m[0].length;
     }
-    if (last < text.length) {
-      frag.appendChild(document.createTextNode(text.slice(last)));
-    }
-    node.parentNode.replaceChild(frag, node);
+    if (!parts.length) return;
+    parts.push(text.slice(last));
+    node.replaceWith(...parts.filter((p) => p !== ""));
   }
 
-  function observeMutations() {
-    if (hlObserver || !document.body) {
-      return;
-    }
+  function observe() {
     let pending = [];
     let timer = null;
-    hlObserver = new MutationObserver((mutations) => {
+    new MutationObserver((mutations) => {
       for (const mu of mutations) {
         for (const node of mu.addedNodes) {
-          if (node.nodeType === 1) {
-            if (node.id === CARD_ID || node.id === "mlwa-hl-tip") {
-              continue;
-            }
-            if (node.classList && node.classList.contains(HL_CLASS)) {
-              continue;
-            }
-            pending.push(node);
-          } else if (node.nodeType === 3) {
+          if (node.nodeType === 3 || (node.nodeType === 1 && node.id !== CARD_ID && !node.classList.contains(HL))) {
             pending.push(node);
           }
         }
@@ -971,20 +343,11 @@
           pending = [];
           timer = null;
           for (const node of batch) {
-            if (!node.isConnected) {
-              continue;
-            }
-            if (node.nodeType === 1) {
-              highlightRoot(node);
-            } else if (node.nodeType === 3) {
-              highlightTextNode(node);
-            }
+            if (!node.isConnected) continue;
+            node.nodeType === 1 ? scan(node) : highlightText(node);
           }
         }, 400);
       }
-    });
-    hlObserver.observe(document.body, { childList: true, subtree: true });
+    }).observe(document.body, { childList: true, subtree: true });
   }
-
-  initHighlight().catch((e) => console.debug("[多语言查词助手] 高亮初始化失败", e));
 })();

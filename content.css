@@ -106,7 +106,31 @@
 }
 
 .mlwa-tag-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-top: 4px;
+}
+
+/* 读音取自 Wiktionary 时打个小勾 */
+.mlwa-dict::after {
+  content: " ✓";
+  color: #0f766e;
+}
+
+#mlwa-card-root .mlwa-lang-select {
+  flex: 0 1 auto;
+  min-width: 0;
+  height: 24px;
+  margin: 0;
+  padding: 0 4px;
+  color: #334155;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .mlwa-lang-tag {
